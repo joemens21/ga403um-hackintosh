@@ -953,7 +953,8 @@ const uint32_t kBeaconHeader = 0x40;
 const uint32_t kEventScanResult = 0xc9, kEventScanDone = 0xed, kEventAssoc = 0x4e, kEventJoin = 0xd3, kEventFirstBeacon = 0xd4,
                kEventConnect = 0xd5, kEventLinkStatus = 0xd8;
 // 20 MHz channels the core's scan covers (itlmt7925_m2.cpp): the only channels a result can come from.
-const uint8_t kScanChannels[] = {1, 6, 11, 36, 40, 44, 48, 149, 153, 157, 161, 165};
+// the channels the core's scan request covers (itlmt7925_m2.cpp, UNI_SCAN_CHANNEL): 2.4 GHz 1..11, 5 GHz UNII-1 and UNII-3
+const uint8_t kScanChannels[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 36, 40, 44, 48, 149, 153, 157, 161, 165};
 const uint32_t kScanTimeoutTicks = 2500;       // 25 s at the 10 ms tick: the core blocks up to 15 s per scan
 const uint32_t kJoinTimeoutTicks = 4500;       // 45 s: scan for the AP, authentication, association, handshake
 
@@ -1058,9 +1059,39 @@ IOReturn itlmt7925WifiInterface::setWCL_SCAN_ABORT(void *)
     return kIOReturnSuccess;
 }
 
+// A request without a key is an open network *or* an 802.1X / SAE one (Apple's supplicant hands those over the same way), so
+// the beacons decide: open only if the SSID was heard in the last minute and every BSS of it has neither PRIVACY nor an RSN / WPA
+// element. Anything else keeps the old answer (unsupported) and never reaches the core as an open join.
+bool itlmt7925WifiInterface::ssidIsOpen(const uint8_t *ssid, uint32_t len)
+{
+    ItlNativeAp *aps = (ItlNativeAp *)IOMalloc(sizeof(ItlNativeAp) * ITL_NATIVE_AP_MAX);
+    if (!aps) return false;
+    ItlNativeNets n;
+    bzero(&n, sizeof(n));
+    n.version = 1;
+    n.max = ITL_NATIVE_AP_MAX;
+    n.aps = aps;
+    uint32_t open = 0, secured = 0;
+    if (core && core->callPlatformFunction(ITL_NATIVE_NETS, false, &n, nullptr, nullptr, nullptr) == kIOReturnSuccess) {
+        for (uint32_t i = 0; i < n.count && i < ITL_NATIVE_AP_MAX; i++) {
+            const ItlNativeAp &a = aps[i];
+            if (a.ageMs > 60000 || a.ssidLen != len || memcmp(a.ssid, ssid, len)) continue;
+            bool sec = (a.capability & 0x0010) != 0;
+            for (uint32_t o = 0; !sec && o + 2 <= a.ieLen && o + 2 + a.ie[o + 1] <= a.ieLen; o += 2 + a.ie[o + 1]) {
+                const uint8_t *e = a.ie + o;
+                if (e[0] == 0x30) sec = true;                                                          // RSN
+                if (e[0] == 0xdd && e[1] >= 4 && e[2] == 0x00 && e[3] == 0x50 && e[4] == 0xf2 && e[5] == 1) sec = true;   // WPA
+            }
+            if (sec) secured++; else open++;
+        }
+    }
+    IOFree(aps, sizeof(ItlNativeAp) * ITL_NATIVE_AP_MAX);
+    return open > 0 && secured == 0;
+}
+
 // apple80211AssocCandidates (partial): +0x1c u32 ssid_len, +0x20 ssid[32], +0x40 apple80211_key {+4 key_len, +8 cipher_type,
 // +0x10 key[]}. Apple's supplicant runs in userland: cipher_type 6 / 9 with a 32-byte key is the pairwise master key (derived
-// from the passphrase), 0 is "no key". The 4-way handshake and the data keys are the core's; it supports WPA2-PSK / CCMP only.
+// from the passphrase), 0 is "no key" (an open network). The 4-way handshake and the data keys are the core's: WPA2-PSK / CCMP.
 IOReturn itlmt7925WifiInterface::setWCL_ASSOCIATE(apple80211AssocCandidates *d)
 {
     itlmtCall(ctl, 'S', 595);
@@ -1073,13 +1104,25 @@ IOReturn itlmt7925WifiInterface::setWCL_ASSOCIATE(apple80211AssocCandidates *d)
     memcpy(&cipher, b + 0x48, 4);
     itlmtTrace(ctl, "assoc:request ssidLen=%u cipher=%u keyLen=%u", ssidLen, cipher, keyLen);
     if (ssidLen == 0 || ssidLen > 32) return kIOReturnBadArgument;
-    if (!((cipher == 6 || cipher == 9) && keyLen == 32)) return kIOReturnUnsupported;   // open / SAE / enterprise: not implemented
+    // no key at all and only open beacons for the SSID: an open network (the core checks PRIVACY again before it associates)
+    const bool open = cipher == 0 && keyLen == 0 && ssidIsOpen(b + 0x20, ssidLen);
+    if (!((cipher == 6 || cipher == 9) && keyLen == 32)) {
+        // no passphrase key in this request (open, 802.1X, SAE): record the parts of the layout that are not known yet, for the
+        // enterprise work (+0x00..+0x1b before the SSID, +0x40..+0x5f the key header and the start of the key area)
+        char h0[2 * 0x1c + 1], h1[2 * 0x20 + 1];
+        for (int i = 0; i < 0x1c; i++) snprintf(h0 + 2 * i, 3, "%02x", b[i]);
+        for (int i = 0; i < 0x20; i++) snprintf(h1 + 2 * i, 3, "%02x", b[0x40 + i]);
+        itlmtTrace(ctl, "assoc:raw00 %s", h0);
+        itlmtTrace(ctl, "assoc:raw40 %s", h1);
+    }
+    if (!open && !((cipher == 6 || cipher == 9) && keyLen == 32)) return kIOReturnUnsupported;   // SAE / enterprise: not implemented
     ItlNativeJoin j;
     bzero(&j, sizeof(j));
-    j.version = 1;
+    j.version = open ? 2 : 1;
     j.ssidLen = (uint8_t)ssidLen;
     memcpy(j.ssid, b + 0x20, ssidLen);
-    memcpy(j.pmk, b + 0x50, 32);
+    if (open) j.open = 1;
+    else memcpy(j.pmk, b + 0x50, 32);
     IOReturn r = core->callPlatformFunction(ITL_NATIVE_JOIN, false, &j, nullptr, nullptr, nullptr);
     bzero(&j, sizeof(j));
     if (r != kIOReturnSuccess) { itlmtTrace(ctl, "assoc:core join=%x", r); return r; }

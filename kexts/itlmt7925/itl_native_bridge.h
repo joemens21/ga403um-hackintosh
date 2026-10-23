@@ -52,11 +52,13 @@ struct ItlNativeNets {
 
 // ITL_NATIVE_JOIN, p1 = ItlNativeJoin*: connect to `ssid` with a ready pairwise master key (the supplicant of Apple's design
 // runs in userland; the 4-way handshake still runs in the core). The core wipes its copy; the caller wipes this one.
+// Version 2 adds `open`: an open network (no RSN, no handshake, pmk unused). A version 1 core refuses version 2.
 struct ItlNativeJoin {
     uint32_t version;
     uint8_t ssidLen;
     char ssid[33];
     uint8_t pmk[32];
+    uint8_t open;
 };
 #define ITL_NATIVE_JOIN "itlmt-native-join-v1"
 // ITL_NATIVE_LEAVE, p1 unused: leave the network / abort a join in progress.

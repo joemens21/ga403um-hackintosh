@@ -273,12 +273,14 @@ IOReturn itlmt7925::nativeScanReq(uint32_t *started)
 IOReturn itlmt7925::nativeJoin(const ItlNativeJoin *j)
 {
     if (!m3On || !cmdLock || !wstate[0]) return kIOReturnNotReady;
-    if (!j || j->version != 1 || !j->ssidLen || j->ssidLen > 32) return kIOReturnBadArgument;
+    if (!j || (j->version != 1 && j->version != 2) || !j->ssidLen || j->ssidLen > 32) return kIOReturnBadArgument;
+    const bool open = j->version >= 2 && j->open;
     IOLockLock(cmdLock);
     bzero(&reqNet, sizeof(reqNet));
     memcpy(reqNet.ssid, j->ssid, j->ssidLen);
-    memcpy(reqNet.pmk, j->pmk, sizeof(reqNet.pmk));
-    reqNet.hasPmk = true;
+    if (!open) memcpy(reqNet.pmk, j->pmk, sizeof(reqNet.pmk));
+    reqNet.hasPmk = !open;
+    reqNet.open = open;
     reqNet.native = true;
     njFail = 0;
     njState = ITL_NATIVE_CONNECTING;
@@ -544,6 +546,7 @@ static const char *failText(const char *stage)
     if (!strncmp(stage, "auth-fail", 9)) return "the access point refused authentication";
     if (!strncmp(stage, "assoc-fail", 10)) return "the access point refused association";
     if (!strncmp(stage, "hs-fail", 7)) return "key handshake failed";
+    if (!strncmp(stage, "sec-mismatch", 12)) return "the network needs a password";
     return "connection failed";
 }
 

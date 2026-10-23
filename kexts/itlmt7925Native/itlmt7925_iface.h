@@ -85,6 +85,7 @@ private:
     // scan / join (stage 3): requests are handed to the core through ITL_NATIVE_*; results are posted from the datapath tick
     void pollControl();
     void deliverScanResults();
+    bool ssidIsOpen(const uint8_t *ssid, uint32_t len);
     void finishJoin(const ItlNativeStatus &st, bool ok);
     void postLinkStatus(const uint8_t *bssid, bool up, uint32_t reason);
     void postEvent(uint32_t code, void *data, size_t length);

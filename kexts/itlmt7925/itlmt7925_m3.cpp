@@ -733,7 +733,9 @@ int itlmt7925::m3Assoc()
     // 2.4 GHz: advertise the CCK rates the AP's basic set usually contains also on the legacy path (an AP whose basic rates are
     // 1/2/5.5/11 refuses a station that offers OFDM only)
     bool g2 = tgtCh <= 14;
-    put16(p, g2 ? 0x0431 : 0x0411); p += 2;                     // ESS | PRIVACY | short slot (| short preamble on 2.4 GHz)
+    uint16_t capInfo = g2 ? 0x0431 : 0x0411;                    // ESS | PRIVACY | short slot (| short preamble on 2.4 GHz)
+    if (m3open) capInfo &= (uint16_t)~0x0010;                    // open network: no PRIVACY
+    put16(p, capInfo); p += 2;
     put16(p, 10); p += 2;                                        // listen interval
     uint8_t sl = (uint8_t)strlen(m3ssid);
     *p++ = 0; *p++ = sl; memcpy(p, m3ssid, sl); p += sl;
@@ -744,7 +746,7 @@ int itlmt7925::m3Assoc()
     if (g2) { *p++ = 50; *p++ = 4; memcpy(p, ext2g, 4); p += 4; }
     static const uint8_t rsn[22] = {0x30, 0x14, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04,
                                     0x01, 0x00, 0x00, 0x0f, 0xac, 0x02, 0x00, 0x00};
-    memcpy(p, rsn, sizeof(rsn)); p += sizeof(rsn);
+    if (!m3open) { memcpy(p, rsn, sizeof(rsn)); p += sizeof(rsn); }
     if (fastActive) {
         p += itl_caps_build_ht(p);
         if (apCaps.vht) p += itl_caps_build_vht(p, fastAllow160);
@@ -769,6 +771,7 @@ int itlmt7925::m3Run1()
     m3stepDown = m3stepRadio = false;                        // per-attempt state (an earlier attempt may have failed half way)
     m3reachedAssoc = false;
     m3cipher = 0;
+    m3open = false;
     m3dataOn = false;
     m3linkUp = false;
     m3wantEapol = false;
@@ -816,6 +819,7 @@ int itlmt7925::m3Run1()
     if (sel < 0) { m3log("no configured network seen in the scan"); return ITL_EIO; }
     strlcpy(m3ssid, nets[sel].ssid, sizeof(m3ssid));
     strlcpy(m3psk, nets[sel].psk, sizeof(m3psk));
+    m3open = nets[sel].open;
     // candNets stays: the fall-back ladder in m3Run() calls this again for the next level; m3Supervise() wipes it afterwards
     m3log("selected net%d ssid len=%u", sel + 1, (unsigned)strlen(m3ssid));
     m3log("target %02x:%02x:%02x:%02x:%02x:%02x ch=%u cap=%04x bi=%u ies=%u", tgtBssid[0], tgtBssid[1], tgtBssid[2],
@@ -829,14 +833,19 @@ int itlmt7925::m3Run1()
         lvl = fastLevel;
     }
 
+    // An open join for a network that asks for encryption (PRIVACY in its beacon) can only fail at association: stop here.
+    if (m3open && (tgtCap & 0x0010)) { m3log("open join, but the AP sets PRIVACY"); m3Publish("sec-mismatch"); return ITL_EIO; }
+
     // PMK now (4096 PBKDF2 iterations), kept for the 4-way handshake; native Wi-Fi hands over the key its supplicant derived
-    uint8_t pmk[32];
-    if (nets[sel].hasPmk) memcpy(pmk, nets[sel].pmk, sizeof(pmk));
-    else itl_wpa_pmk(m3psk, (const uint8_t *)m3ssid, strlen(m3ssid), pmk);
-    memcpy(m3pmk, pmk, sizeof(m3pmk));
-    bzero(pmk, sizeof(pmk));
-    m3log("pmk ready");
-    m3Publish("pmk");
+    if (!m3open) {
+        uint8_t pmk[32];
+        if (nets[sel].hasPmk) memcpy(pmk, nets[sel].pmk, sizeof(pmk));
+        else itl_wpa_pmk(m3psk, (const uint8_t *)m3ssid, strlen(m3ssid), pmk);
+        memcpy(m3pmk, pmk, sizeof(m3pmk));
+        bzero(pmk, sizeof(pmk));
+        m3log("pmk ready");
+        m3Publish("pmk");
+    }
 
     // step 2: firmware / hardware prep, BSS + STA records in the "not associated" state, ROC on the AP's channel
     m3ParseAp();
@@ -859,13 +868,19 @@ int itlmt7925::m3Run1()
         m3Publish(rc ? "assoc-fail" : "assoc-ok");
     }
 
-    // step 4: BSS up, station state "associated", 4-way handshake with key install, Ethernet interface
+    // step 4: BSS up, station state "associated", 4-way handshake with key install (open network: none, the data path starts
+    // right away with m3cipher 0), Ethernet interface
     if (!rc) {
         m3Bss(true);
         m3Sta(2, false, m3aid);
-        rc = m3Handshake();
-        m3wantEapol = false;
-        m3Publish(rc ? "hs-fail" : "hs-ok");
+        if (m3open) {
+            m3dataOn = true;
+            m3Publish("open-ok");
+        } else {
+            rc = m3Handshake();
+            m3wantEapol = false;
+            m3Publish(rc ? "hs-fail" : "hs-ok");
+        }
     }
     m3Roc(false);
     bzero(m3pmk, sizeof(m3pmk));
@@ -1273,7 +1288,7 @@ int itlmt7925::ethTx(const uint8_t *e, uint32_t len)
 {
     if (!m3linkUp || len < 14) return -1;
     bool full = false;
-    bool ok = m3TxData(e, be16p(e + 12), e + 14, len - 14, true, &full);
+    bool ok = m3TxData(e, be16p(e + 12), e + 14, len - 14, m3cipher != 0, &full);   // open network: sent in the clear
     if (full) return 1;
     if (isBigEcho(e, len, 8)) icmpReqTx++;
     if (ok) stTx++; else stTxFail++;
