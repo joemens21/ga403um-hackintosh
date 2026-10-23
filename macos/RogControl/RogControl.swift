@@ -148,19 +148,69 @@ enum Sensors {
         }
         return (t, w)
     }
-    // average effective MHz of the busy CPUs 0-7 (Zen 5) and 8-23 (Zen 5c) from debug.amdcppc.freq
-    static func clocks() -> (big: Int, little: Int)? {
+    // AmdCppc decodes P0 with the Zen 5 rule (12-bit FID x 5 MHz). On a Zen 4 CPU (family 0x19: the GA403UM's Ryzen 9 270)
+    // the register is FID [7:0] x 200 / DID [13:8]: "P0 11040 MHz" is really 4000 MHz. Every clock in the report scales by
+    // the same factor, so it is corrected here until AmdCppc decodes Zen 4 itself.
+    static func clockFactor(_ report: String) -> Double {
+        var family: Int32 = 0, n = MemoryLayout<Int32>.size
+        guard sysctlbyname("machdep.cpu.family", &family, &n, nil, 0) == 0, family == 0x19,
+              let p0s = report.split(separator: " ").dropFirst().first, let p0 = Int(p0s), p0 > 0, p0 % 5 == 0 else { return 1 }
+        let fid12 = p0 / 5, fid = fid12 & 0xFF, did = (fid12 >> 8) & 0x3F
+        guard did > 0, fid > 0 else { return 1 }
+        return Double(fid * 200 / did) / Double(p0)
+    }
+    // (cpu, MHz while busy, busy %) from debug.amdcppc.freq, corrected
+    static func cpuClocks() -> [(cpu: Int, mhz: Int, busy: Int)]? {
         guard let s = string("debug.amdcppc.freq") else { return nil }
-        var big: [Int] = [], little: [Int] = []
+        let k = clockFactor(s)
+        var out: [(cpu: Int, mhz: Int, busy: Int)] = []
         for part in s.split(separator: "|").dropFirst() {
             let f = part.split(separator: " ")
             guard f.count >= 2, let cpu = Int(f[0]) else { continue }
             let v = f[1].split(separator: "/")
-            guard v.count >= 2, let mhz = Int(v[0]), let busy = Int(v[1].dropLast()), busy >= 50 else { continue }
-            if cpu < 8 { big.append(mhz) } else { little.append(mhz) }
+            guard v.count >= 2, let mhz = Int(v[0]), let busy = Int(v[1].dropLast()) else { continue }
+            out.append((cpu, Int(Double(mhz) * k), busy))
         }
+        return out
+    }
+    // average effective MHz of the busy CPUs 0-7 (Zen 5) and 8-23 (Zen 5c); on an 8-core Zen 4 every CPU counts as "big"
+    static func clocks() -> (big: Int, little: Int)? {
+        guard let all = cpuClocks() else { return nil }
+        var big: [Int] = [], little: [Int] = []
+        for c in all where c.busy >= 50 { if c.cpu < 8 || ProcessInfo.processInfo.activeProcessorCount <= 16 { big.append(c.mhz) } else { little.append(c.mhz) } }
         func avg(_ a: [Int]) -> Int { a.isEmpty ? 0 : a.reduce(0, +) / a.count }
         return (avg(big), avg(little))
+    }
+    // busy-weighted average clock of all CPUs (what the CPU runs at while it works), nil when idle
+    static func clock() -> Int? {
+        guard let all = cpuClocks() else { return nil }
+        let w = all.reduce(0) { $0 + $1.busy }
+        return w < 5 ? nil : all.reduce(0) { $0 + $1.mhz * $1.busy } / w
+    }
+}
+
+// AppleSmartBattery (SMCBatteryManager): voltage, current, time estimates and cycle count
+struct BatteryInfo {
+    var watts: Double?             // positive charging, negative discharging
+    var minutesLeft: Int?          // to empty while discharging, to full while charging
+    var cycles: Int?
+    static func read() -> BatteryInfo {
+        var b = BatteryInfo()
+        let svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery"))
+        guard svc != 0 else { return b }
+        defer { IOObjectRelease(svc) }
+        var props: Unmanaged<CFMutableDictionary>?
+        guard IORegistryEntryCreateCFProperties(svc, &props, kCFAllocatorDefault, 0) == KERN_SUCCESS,
+              let d = props?.takeRetainedValue() as? [String: Any] else { return b }
+        func int(_ k: String) -> Int? { (d[k] as? NSNumber)?.intValue }
+        if let mv = int("Voltage"), let raw = (d["InstantAmperage"] as? NSNumber) ?? (d["Amperage"] as? NSNumber) {
+            let ma = Int(Int16(truncatingIfNeeded: raw.int64Value))        // signed mA in a 64-bit field
+            b.watts = Double(mv) * Double(ma) / 1_000_000
+        }
+        let charging = (d["IsCharging"] as? Bool) ?? false
+        if let t = int(charging ? "AvgTimeToFull" : "AvgTimeToEmpty"), t > 0, t < 65535 { b.minutesLeft = t }
+        b.cycles = int("CycleCount")
+        return b
     }
 }
 
@@ -181,17 +231,22 @@ struct SourceSettings {
     var mode: Mode
     var spl: Int, sppt: Int, fppt: Int
     var fanBase: Mode            // whose firmware fan curve Manual uses (silent / performance / turbo)
+    var customFans = false       // Manual: use the edited duties below instead of the firmware curve
+    var customDuty: [[Int]] = [[], []]   // per fan (CPU, GPU): 8 duties in %, on the temperatures of the fanBase curve
     static func load(ac: Bool) -> SourceSettings {
         let d = UserDefaults.standard, k = ac ? "ac." : "battery."
         func i(_ n: String, _ def: Int) -> Int { d.object(forKey: k + n) == nil ? def : d.integer(forKey: k + n) }
+        func duties(_ fan: Int) -> [Int] { (d.array(forKey: k + "duty\(fan)") as? [Int]).flatMap { $0.count == 8 ? $0 : nil } ?? [] }
         return SourceSettings(mode: Mode(rawValue: d.string(forKey: k + "mode") ?? "") ?? .performance,
                               spl: i("spl", ac ? 45 : 30), sppt: i("sppt", ac ? 65 : 35), fppt: i("fppt", ac ? 80 : 50),
-                              fanBase: Mode(rawValue: d.string(forKey: k + "fanBase") ?? "") ?? .performance)
+                              fanBase: Mode(rawValue: d.string(forKey: k + "fanBase") ?? "") ?? .performance,
+                              customFans: d.bool(forKey: k + "customFans"), customDuty: [duties(0), duties(1)])
     }
     func save(ac: Bool) {
         let d = UserDefaults.standard, k = ac ? "ac." : "battery."
         d.set(mode.rawValue, forKey: k + "mode"); d.set(spl, forKey: k + "spl"); d.set(sppt, forKey: k + "sppt")
         d.set(fppt, forKey: k + "fppt"); d.set(fanBase.rawValue, forKey: k + "fanBase")
+        d.set(customFans, forKey: k + "customFans"); d.set(customDuty[0], forKey: k + "duty0"); d.set(customDuty[1], forKey: k + "duty1")
     }
 }
 
@@ -223,7 +278,12 @@ enum Apply {
         guard Asus.set(.profile, Mode.performance.firmwareProfile) == KERN_SUCCESS else { return "could not set the profile" }
         let base = s.fanBase == .turbo && !st.ac ? Mode.performance : s.fanBase
         for fan in 0..<2 {
-            guard let c = Asus.fanCurve(fan: fan, profile: base.firmwareProfile) else { return "could not read the fan curve" }
+            guard var c = Asus.fanCurve(fan: fan, profile: base.firmwareProfile) else { return "could not read the fan curve" }
+            if s.customFans, s.customDuty[fan].count == 8 {
+                let floor = FanSafety.floor(fan: fan, base: c)
+                let duty = FanSafety.clamp(s.customDuty[fan], floor: floor)
+                for i in 0..<8 { c[8 + i] = UInt8(duty[i]) }
+            }
             guard Asus.setFanCurve(fan: fan, c) == KERN_SUCCESS else { return "the fan curve was refused" }
         }
         let r = st.ranges
@@ -237,6 +297,57 @@ enum Apply {
     }
 }
 
+// Edited fan curves never go below the firmware's own Silent curve at the same point (the quietest curve ASUS ships for
+// this board), never fall as the temperature rises, and stay within 0...100 %. Without a readable Silent curve the floor is
+// the base curve itself, so edits can only make the fans faster.
+enum FanSafety {
+    static func floor(fan: Int, base: [UInt8]) -> [Int] {
+        let silent = Asus.fanCurve(fan: fan, profile: Mode.silent.firmwareProfile)
+        return (0..<8).map { i in
+            let b = Int(base[8 + i]) <= 100 ? Int(base[8 + i]) : 100
+            guard let s = silent, s.count == 16, abs(Int(s[i]) - Int(base[i])) <= 3, Int(s[8 + i]) <= 100 else { return b }   // same temperature only
+            return min(b, Int(s[8 + i]))
+        }
+    }
+    static func clamp(_ duty: [Int], floor: [Int]) -> [Int] {
+        var out: [Int] = []
+        for i in 0..<8 {
+            let v = min(100, max(duty.count == 8 ? duty[i] : floor[i], floor[i], out.last ?? 0))
+            out.append(v)
+        }
+        return out
+    }
+}
+
+// One history point per refresh (2 s while a window is open, 30 s otherwise), ten minutes kept
+struct Sample: Identifiable {
+    let id = UUID()
+    let t: Date
+    let cpuC: Double?, gpuC: Double?, cpuW: Double?, cpuRpm: Int, gpuRpm: Int
+}
+
+// Speaker amp level: the strixamp daemon re-reads this file every 3 s (key "volume", dB, -60...0; other keys are kept)
+enum Speakers {
+    static var url: URL { FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/RogAudio/settings.plist") }
+    static var daemonInstalled: Bool { FileManager.default.fileExists(atPath: "/Library/LaunchDaemons/com.itlmt7925.strixamp.plist") }
+    static func read() -> Double? { (NSDictionary(contentsOf: url) as? [String: Any])?["volume"] as? Double }
+    static func write(_ db: Double) -> Bool {
+        var d = (NSDictionary(contentsOf: url) as? [String: Any]) ?? [:]
+        d["volume"] = min(0, max(-60, db))
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        return (d as NSDictionary).write(to: url, atomically: true)
+    }
+    // the daemon's last "controls volume -6.0 dB mute 0" line
+    static func applied() -> String? {
+        guard let h = FileHandle(forReadingAtPath: "/var/log/strixamp.log") else { return nil }
+        defer { try? h.close() }
+        let size = (try? h.seekToEnd()) ?? 0
+        try? h.seek(toOffset: size > 8192 ? size - 8192 : 0)
+        guard let data = try? h.readToEnd(), let text = String(data: data, encoding: .utf8) else { return nil }
+        return text.split(separator: "\n").last { $0.contains("controls volume") }.map { String($0.split(separator: ":").last ?? "") }
+    }
+}
+
 // ---- model -------------------------------------------------------------------------------------------------------------------
 @MainActor
 final class RogModel: ObservableObject {
@@ -244,6 +355,15 @@ final class RogModel: ObservableObject {
     @Published var tctl: Double?
     @Published var watts: Double?
     @Published var gpu: nvgpu_stat?                          // nil: the NVIDIA driver is not reachable
+    @Published var cpuMHz: Int?                              // busy-weighted CPU clock, nil when idle
+    @Published var battery = BatteryInfo()
+    @Published var history: [Sample] = []
+    @Published var kbdTimeout = UserDefaults.standard.integer(forKey: "kbdTimeout")        // s, 0 = never
+    @Published var kbdOffOnBattery = UserDefaults.standard.bool(forKey: "kbdOffOnBattery")
+    @Published var kbdDimmed = false                         // the backlight is off for the timeout / battery rule
+    @Published var speakerDb: Double = Speakers.read() ?? -6
+    @Published var speakerApplied = Speakers.applied()
+    private var idleTimer: Timer?
     @Published var settings = SourceSettings.load(ac: true)
     @Published var charge = UserDefaults.standard.object(forKey: "charge") == nil ? 100 : UserDefaults.standard.integer(forKey: "charge")
     @Published var kbd = UserDefaults.standard.object(forKey: "kbd") == nil ? 2 : UserDefaults.standard.integer(forKey: "kbd")
@@ -263,6 +383,7 @@ final class RogModel: ObservableObject {
     var manualDirty: Bool {
         let saved = SourceSettings.load(ac: st.ac)
         return settings.spl != saved.spl || settings.sppt != saved.sppt || settings.fppt != saved.fppt || settings.fanBase != saved.fanBase
+            || settings.customFans != saved.customFans || settings.customDuty != saved.customDuty
     }
     var onChange: (() -> Void)?
     private var timer: Timer?
@@ -295,6 +416,43 @@ final class RogModel: ObservableObject {
             CFRunLoopAddSource(CFRunLoopGetMain(), src, .defaultMode)
         }
         schedule()
+        scheduleIdle()
+    }
+
+    // keyboard backlight off after kbdTimeout s without input, or on battery; back on with the next input / AC
+    func scheduleIdle() {
+        idleTimer?.invalidate(); idleTimer = nil
+        if kbdTimeout == 0 && !kbdOffOnBattery { if kbdDimmed { undim() }; return }
+        idleTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.checkIdle() }
+        }
+    }
+    func checkIdle() {
+        guard st.lighting else { return }
+        // kCGAnyInputEventType (~0) has no CGEventType case, so it goes in as a bit pattern
+        let idle = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: unsafeBitCast(UInt32.max, to: CGEventType.self))
+        let off = (kbdTimeout > 0 && idle >= Double(kbdTimeout)) || (kbdOffOnBattery && !st.ac)
+        if off && !kbdDimmed && kbd > 0 {
+            if Asus.set(.kbd, 0) == KERN_SUCCESS { kbdDimmed = true }
+        } else if !off && kbdDimmed { undim() }
+    }
+    private func undim() { kbdDimmed = false; Asus.set(.kbd, kbd); st = Asus.state() }
+    func setKbdTimeout(_ s: Int) { kbdTimeout = s; UserDefaults.standard.set(s, forKey: "kbdTimeout"); scheduleIdle() }
+    func setKbdOffOnBattery(_ on: Bool) { kbdOffOnBattery = on; UserDefaults.standard.set(on, forKey: "kbdOffOnBattery"); scheduleIdle(); checkIdle() }
+    func setSpeaker(_ db: Double) {
+        speakerDb = db
+        message = Speakers.write(db) ? String(format: "speaker level %.0f dB (applied by the amp daemon within 3 s)", db) : "could not write the speaker settings"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in MainActor.assumeIsolated { self?.speakerApplied = Speakers.applied() } }
+    }
+    func setCustomFans(_ on: Bool) {
+        settings.customFans = on
+        if on { for fan in 0..<2 where settings.customDuty[fan].count != 8 { settings.customDuty[fan] = baseDuty(fan) } }
+    }
+    // the fanBase firmware curve's duties, the starting point of an edit
+    func baseDuty(_ fan: Int) -> [Int] {
+        let b = settings.fanBase == .turbo && !st.ac ? Mode.performance : settings.fanBase
+        guard let c = Asus.fanCurve(fan: fan, profile: b.firmwareProfile) else { return [] }
+        return (0..<8).map { Int(c[8 + $0]) }
     }
 
     func schedule() {
@@ -311,6 +469,15 @@ final class RogModel: ObservableObject {
         tctl = s.tctl; watts = s.watts
         var g = nvgpu_stat()
         gpu = nvgpu_read(&g) == 0 ? g : nil
+        cpuMHz = Sensors.clock()
+        battery = BatteryInfo.read()
+        if visible { speakerApplied = Speakers.applied() }
+        // the keyboard level can change from Fn+F2 / F3 in the kext: adopt it as the setting (not while dimmed by the timeout)
+        if !kbdDimmed, let k = st.kbd, k != kbd { kbd = k; UserDefaults.standard.set(k, forKey: "kbd") }
+        let gt = gpu.flatMap { $0.tempC == NVGPU_NONE ? nil : Double($0.tempC) }
+        history.append(Sample(t: Date(), cpuC: tctl, gpuC: gt, cpuW: watts, cpuRpm: st.cpuFan, gpuRpm: st.gpuFan))
+        let cut = Date().addingTimeInterval(-600)
+        if let first = history.firstIndex(where: { $0.t >= cut }), first > 0 { history.removeFirst(first) }
         if st.present, lastAC != nil, lastAC != st.ac { powerChanged() }
         lastAC = st.ac
         if previousMode != activeMode { loadCurve() }
@@ -352,6 +519,7 @@ final class RogModel: ObservableObject {
     func applyLighting() {
         guard st.lighting else { return }
         var errs: [String] = []
+        kbdDimmed = false
         if st.auraSupported, Asus.set(.aura, aura.packed) != KERN_SUCCESS { errs.append("keyboard colour refused") }
         if Asus.set(.kbd, kbd) != KERN_SUCCESS { errs.append("keyboard light refused") }
         if Asus.set(.slash, slash.packed) != KERN_SUCCESS { errs.append("Slash refused") }
@@ -360,7 +528,7 @@ final class RogModel: ObservableObject {
         if !errs.isEmpty { message = lightingError }
     }
     func setKbd(_ v: Int) {
-        kbd = v; UserDefaults.standard.set(v, forKey: "kbd")
+        kbd = v; UserDefaults.standard.set(v, forKey: "kbd"); kbdDimmed = false
         lightingError = Asus.set(.kbd, v) == KERN_SUCCESS ? "" : "Keyboard light was not applied. Check the keyboard connection."
         message = lightingError.isEmpty ? "keyboard light \(v)" : lightingError
         st = Asus.state()
@@ -392,7 +560,18 @@ final class RogModel: ObservableObject {
         var s = ""
         if st.batFull > 0 { s += String(format: "health %.0f %% (%d / %d mAh)", 100.0 * Double(st.batFull) / Double(st.batDesign), st.batFull, st.batDesign) }
         if st.batFull > 0, st.batNow > 0 { s += String(format: " · %.0f %%", 100.0 * Double(st.batNow) / Double(st.batFull)) }
-        if st.batState & 2 != 0 { s += " · charging \(st.batRate) mA" } else if st.batState & 1 != 0 { s += " · \(st.batRate) mA" }
+        if let w = battery.watts, abs(w) >= 0.5 {
+            s += String(format: w > 0 ? " · charging %.1f W" : " · using %.1f W", abs(w))
+            if let t = battery.minutesLeft, t < 24 * 60 { s += " · \(t / 60) h \(t % 60) min " + (w > 0 ? "to full" : "left") }
+        } else if st.batState & 2 != 0 { s += " · charging \(st.batRate) mA" } else if st.batState & 1 != 0 { s += " · \(st.batRate) mA" }
+        if let c = battery.cycles, c > 0 { s += " · \(c) cycles" }
+        return s
+    }
+    // popover: "using 12.3 W · 3 h 20 min left"
+    var batteryPower: String? {
+        guard let w = battery.watts, abs(w) >= 0.5 else { return nil }
+        var s = String(format: w > 0 ? "charging %.1f W" : "using %.1f W", abs(w))
+        if let t = battery.minutesLeft, t < 24 * 60 { s += " · \(t / 60) h \(t % 60) min" }
         return s
     }
     func loadCurve() {
@@ -542,6 +721,129 @@ struct FanCurveView: View {
     }
 }
 
+// Ten minutes of temperatures, CPU package power and fan speeds (one point per refresh)
+struct HistoryCharts: View {
+    let samples: [Sample]
+    var body: some View {
+        if samples.count < 2 {
+            Text("Collecting… a point every 2 s while this window is open, every 30 s otherwise.").font(.callout).foregroundStyle(.secondary)
+        } else {
+            VStack(alignment: .leading, spacing: 14) {
+                chart("Temperature (°C)", [("CPU", \.cpuC), ("GPU", \.gpuC)], domain: 30...100)
+                chart("CPU package power (W)", [("CPU", \.cpuW)], domain: nil)
+                fans
+            }
+        }
+    }
+    private func chart(_ title: String, _ series: [(String, KeyPath<Sample, Double?>)], domain: ClosedRange<Double>?) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title).font(.caption).foregroundStyle(.secondary)
+            Chart {
+                ForEach(series, id: \.0) { name, key in
+                    ForEach(samples) { p in
+                        if let v = p[keyPath: key] {
+                            LineMark(x: .value("Time", p.t), y: .value(title, v), series: .value("Series", name))
+                                .foregroundStyle(by: .value("Series", name))
+                        }
+                    }
+                }
+            }
+            .chartYScale(domain: domain ?? 0...max(10, (samples.compactMap { $0[keyPath: series[0].1] }.max() ?? 10) * 1.2))
+            .chartXAxis { AxisMarks(values: .stride(by: .minute, count: 2)) { _ in AxisGridLine(); AxisValueLabel(format: .dateTime.hour().minute()) } }
+            .chartLegend(series.count > 1 ? .visible : .hidden)
+            .frame(height: 110)
+        }
+    }
+    private var fans: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Fans (RPM)").font(.caption).foregroundStyle(.secondary)
+            Chart {
+                ForEach(samples) { p in
+                    LineMark(x: .value("Time", p.t), y: .value("RPM", p.cpuRpm), series: .value("Fan", "CPU")).foregroundStyle(by: .value("Fan", "CPU"))
+                    LineMark(x: .value("Time", p.t), y: .value("RPM", p.gpuRpm), series: .value("Fan", "GPU")).foregroundStyle(by: .value("Fan", "GPU"))
+                }
+            }
+            .chartXAxis { AxisMarks(values: .stride(by: .minute, count: 2)) { _ in AxisGridLine(); AxisValueLabel(format: .dateTime.hour().minute()) } }
+            .frame(height: 110)
+        }
+    }
+}
+
+// Manual mode: the duty of each point of the fanBase curve, per fan, never below the Silent floor (FanSafety)
+struct FanEditor: View {
+    @ObservedObject var m: RogModel
+    @State private var fan = 0
+    @State private var temps: [[Int]] = [[], []]
+    @State private var floors: [[Int]] = [[], []]
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Duty per point (%) on the \(m.settings.fanBase.title) curve's temperatures").font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Picker("Fan", selection: $fan) { Text("CPU").tag(0); Text("GPU").tag(1) }
+                    .pickerStyle(.segmented).frame(width: 105).controlSize(.small)
+            }
+            if temps[fan].count == 8, floors[fan].count == 8, m.settings.customDuty[fan].count == 8 {
+                ForEach(0..<8, id: \.self) { i in
+                    HStack(spacing: 8) {
+                        Text("\(temps[fan][i])°C").font(.system(size: 11)).monospacedDigit().frame(width: 40, alignment: .trailing)
+                        Slider(value: Binding(get: { Double(m.settings.customDuty[fan][i]) }, set: { v in
+                            var d = m.settings.customDuty[fan]; d[i] = Int(v.rounded())
+                            m.settings.customDuty[fan] = FanSafety.clamp(d, floor: floors[fan])
+                        }), in: 0...100)
+                        .controlSize(.small)
+                        Text("\(m.settings.customDuty[fan][i]) %").font(.system(size: 11)).monospacedDigit().frame(width: 40, alignment: .trailing)
+                    }
+                }
+                Text("Points can't go below the firmware's Silent curve or fall as the temperature rises. Apply to use them.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Button("Back to the firmware curve") { m.settings.customDuty[fan] = m.baseDuty(fan) }.controlSize(.small)
+            } else {
+                Text("Fan curve unavailable from firmware.").font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .onAppear(perform: load)
+        .onChange(of: m.settings.fanBase) { _ in load() }
+    }
+    private func load() {
+        let b = m.settings.fanBase == .turbo && !m.st.ac ? Mode.performance : m.settings.fanBase
+        for f in 0..<2 {
+            guard let c = Asus.fanCurve(fan: f, profile: b.firmwareProfile) else { temps[f] = []; floors[f] = []; continue }
+            temps[f] = (0..<8).map { Int(c[$0]) }
+            floors[f] = FanSafety.floor(fan: f, base: c)
+            if m.settings.customDuty[f].count == 8 { m.settings.customDuty[f] = FanSafety.clamp(m.settings.customDuty[f], floor: floors[f]) }
+        }
+    }
+}
+
+// CS35L56 amp level through the strixamp daemon's settings file
+struct SpeakerControls: View {
+    @ObservedObject var m: RogModel
+    @State private var db: Double = -6
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if !Speakers.daemonInstalled {
+                Text("The strixamp daemon is not installed: speaker level control is unavailable.").foregroundStyle(.secondary)
+            } else {
+                HStack(spacing: 8) {
+                    Text("Amp level").font(.system(size: 12)).frame(width: 70, alignment: .leading)
+                    Slider(value: $db, in: -24...0, step: 1) { editing in if !editing { m.setSpeaker(db) } }
+                    Text(String(format: "%.0f dB", db)).font(.system(size: 12)).monospacedDigit().frame(width: 50, alignment: .trailing)
+                }
+                if db > -6 {
+                    Label("Louder than the tested -6 dB. Lower it if you hear distortion or crackle.", systemImage: "exclamationmark.triangle")
+                        .font(.callout).foregroundStyle(.orange)
+                }
+                Text("This sets the speaker amplifiers' own gain; the macOS volume still works on top of it. "
+                     + (m.speakerApplied.map { "Daemon: \($0.trimmingCharacters(in: .whitespaces))." } ?? ""))
+                    .font(.callout).foregroundStyle(.secondary)
+                Button("Back to -6 dB") { db = -6; m.setSpeaker(-6) }.controlSize(.small)
+            }
+        }
+        .onAppear { db = m.speakerDb }
+    }
+}
+
 struct LimitSlider: View {
     let name: String, help: String
     @Binding var value: Int
@@ -557,7 +859,8 @@ struct LimitSlider: View {
 }
 
 enum RogPage: String, CaseIterable, Identifiable {
-    case overview = "Overview", performance = "Performance", lighting = "Lighting", battery = "Battery & Display", settings = "Settings"
+    case overview = "Overview", performance = "Performance", lighting = "Lighting", battery = "Battery & Display", speakers = "Speakers",
+         settings = "Settings"
     var id: String { rawValue }
     var symbol: String {
         switch self {
@@ -565,6 +868,7 @@ enum RogPage: String, CaseIterable, Identifiable {
         case .performance: return "gauge.with.dots.needle.50percent"
         case .lighting: return "keyboard"
         case .battery: return "battery.75"
+        case .speakers: return "speaker.wave.2"
         case .settings: return "gearshape"
         }
     }
@@ -601,8 +905,10 @@ struct RogControls: View {
                         Stat(symbol: "bolt", value: m.watts.map { String(format: "%.1f W", $0) } ?? "–", label: "Package power")
                         Stat(symbol: "fan", value: m.st.present ? "\(m.st.cpuFan)" : "–", label: "CPU fan · RPM")
                         Stat(symbol: "fan", value: m.st.present ? "\(m.st.gpuFan)" : "–", label: "GPU fan · RPM")
+                        Stat(symbol: "cpu", value: m.cpuMHz.map { "\($0)" } ?? "idle", label: "CPU clock · MHz")
                     }
                 }
+                RogSection(title: "History · last 10 minutes") { HistoryCharts(samples: m.history) }
             }
             if page == .overview || page == .performance {
                 RogSection(title: "Performance mode") { modes.disabled(!m.st.present) }
@@ -625,6 +931,24 @@ struct RogControls: View {
                         if !m.st.lighting { Text("Lighting is unavailable. AsusWmi ABI 3 and the N-KEY keyboard are required.").foregroundStyle(.secondary) }
                     }.disabled(!m.st.present)
                 }
+                RogSection(title: "Keyboard backlight timeout") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack(spacing: 6) {
+                            Text("Turn off after").font(.system(size: 12))
+                            ForEach([(0, "Never"), (30, "30 s"), (60, "1 min"), (120, "2 min"), (300, "5 min")], id: \.0) { v in
+                                ChoiceButton(title: v.1, selected: m.kbdTimeout == v.0) { m.setKbdTimeout(v.0) }
+                            }
+                            Spacer()
+                        }
+                        Toggle("Off on battery", isOn: Binding(get: { m.kbdOffOnBattery }, set: { m.setKbdOffOnBattery($0) }))
+                            .toggleStyle(.switch).controlSize(.small)
+                        Text(m.kbdDimmed ? "Off now: any key or touchpad input turns it back on." : "Any key or touchpad input turns the backlight back on.")
+                            .font(.callout).foregroundStyle(.secondary)
+                    }.disabled(!m.st.lighting)
+                }
+            }
+            if page == .speakers {
+                RogSection(title: "Speaker amplifiers") { SpeakerControls(m: m) }
             }
             if page == .overview || page == .battery {
                 RogSection(title: "Battery care") {
@@ -681,6 +1005,11 @@ struct RogControls: View {
                         .onChange(of: m.settings.fanBase) { _ in m.loadCurve() }
                         Spacer()
                         Button("Apply") { m.saveManual() }.controlSize(.small)
+                    }
+                    if !compact {
+                        Toggle("Custom fan curve", isOn: Binding(get: { m.settings.customFans }, set: { m.setCustomFans($0) }))
+                            .toggleStyle(.switch).controlSize(.small).font(.system(size: 12))
+                        if m.settings.customFans { FanEditor(m: m) }
                     }
                     HStack {
                         Text((m.manualDirty || m.activeMode != .manual || !m.profileError.isEmpty) ? "Changes not applied" : "Applied limits: " + m.st.ppt.map { "\($0) W" }.joined(separator: " / "))
@@ -944,6 +1273,7 @@ struct ContentView: View {
             if m.st.batFull > 0 {
                 HStack {
                     Text("Battery \(min(100, max(0, m.st.batNow * 100 / m.st.batFull)))%")
+                    if let p = m.batteryPower { Text("· " + p) }
                     Spacer()
                     Text(m.st.batState & 2 != 0 ? "Charging" : m.st.ac ? "On AC" : "Discharging")
                 }.font(.caption).foregroundStyle(.secondary)
