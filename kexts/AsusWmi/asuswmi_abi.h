@@ -5,7 +5,7 @@
 #ifndef ASUSWMI_ABI_H
 #define ASUSWMI_ABI_H
 
-#define ASUSWMI_ABI_VERSION 3
+#define ASUSWMI_ABI_VERSION 4
 
 enum {
     kAsusUcGetState  = 0,   // out: struct, uint32_t[ASUS_ST_COUNT]
@@ -25,6 +25,7 @@ enum {                      // kAsusUcSet "what"
     ASUS_SET_BACKLIGHT = 6, // EC brightness level 0..ASUS_ST_BACKLIGHT_MAX (AWMI.WMAA); not the OLED's: that is NullMoth's AUX path
     ASUS_SET_KBD     = 7,   // keyboard backlight 0..3 (N-KEY HID feature report 0x5A)
     ASUS_SET_SLASH   = 8,   // Slash lighting: ASUS_SLASH_PACK(mode, brightness, interval); brightness 0 = off
+    ASUS_SET_AURA    = 9,   // keyboard colour and effect (ABI 4): ASUS_AURA_PACK(mode, speed, 0xRRGGBB)
 };
 
 enum {                      // kAsusUcGetState words
@@ -52,8 +53,10 @@ enum {                      // kAsusUcGetState words
     ASUS_ST_KBD,            // keyboard backlight 0..3 as last set (the keyboard cannot be read), 0xFFFFFFFF unknown
     ASUS_ST_SLASH,          // Slash setting as last set (ASUS_SLASH_PACK), 0xFFFFFFFF unknown
     ASUS_ST_HID,            // 1: the N-KEY keyboard (0b05:19b6) was found
-    ASUS_ST_COUNT = 27
+    ASUS_ST_AURA,           // ABI 4: keyboard colour / effect as last set (ASUS_AURA_PACK), 0xFFFFFFFF unknown
+    ASUS_ST_COUNT = 28
 };
+#define ASUS_ST_COUNT_V3 27 // ABI 3 clients ask for this many words; they still get them
 
 #define ASUS_FL_AC         0x1u    // on AC power (ACPI0003 _PSR)
 #define ASUS_FL_FAN_CUSTOM 0x2u    // a custom fan curve is active (written since the last profile change)
@@ -66,5 +69,14 @@ enum {                      // kAsusUcGetState words
 #define ASUS_SLASH_MODES "Static", "Bounce", "Slash", "Loading", "Bit Stream", "Transmission", "Flow", "Flux", \
                          "Phantom", "Spectrum", "Hazard", "Interfacing", "Ramp", "Game Over", "Start", "Buzzer"
 #define ASUS_SLASH_MODE_COUNT 16
+
+// Keyboard Aura (one zone): mode index (ASUS_AURA_MODES order), speed 0 slow / 1 normal / 2 fast, colour 0xRRGGBB
+// (Rainbow and Colour cycle ignore the colour)
+#define ASUS_AURA_PACK(mode, speed, rgb) (((uint32_t)(rgb) & 0xffffffu) | ((uint32_t)(speed) << 24) | ((uint32_t)(mode) << 26))
+#define ASUS_AURA_RGB(v)   ((v) & 0xffffff)
+#define ASUS_AURA_SPEED(v) (((v) >> 24) & 0x3)
+#define ASUS_AURA_MODE(v)  (((v) >> 26) & 0xf)
+#define ASUS_AURA_MODES "Static", "Breathe", "Colour cycle", "Rainbow", "Strobe"
+#define ASUS_AURA_MODE_COUNT 5
 
 #endif

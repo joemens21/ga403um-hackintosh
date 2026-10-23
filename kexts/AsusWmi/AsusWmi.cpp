@@ -33,6 +33,7 @@
 //                                          BrightnessKeys turns the brightness keys (Notify 0x86 / 0x87 on PEGP.EDP1) into macOS's
 //   sysctl debug.asuswmi.kbd[=<0..3>]      keyboard backlight (N-KEY HID 0b05:19b6, feature report 0x5A, as G-Helper / hid-asus)
 //   sysctl debug.asuswmi.slash[=<packed>]  Slash lighting, ASUS_SLASH_PACK(mode, brightness 0..3, interval 0..5) (report 0x5D)
+//   sysctl debug.asuswmi.aura[=<packed>]   keyboard colour / effect, ASUS_AURA_PACK(mode, speed 0..2, 0xRRGGBB) (report 0x5D)
 //   sysctl debug.asuswmi.key=<code>        emulates a hotkey through WMNB DEVS 0x00100021 (EC0.SKEY): 0x20 brightness up,
 //                                          0x10 down, 0xC4 / 0xC5 keyboard light up / down, 0xAE fan key (testing)
 // Hotkeys: the EC queues a code with ATKD.IANE and sends Notify (ATKD, 0xFF); _WED (0xFF) returns the queued codes. Handled
@@ -134,11 +135,12 @@ public:
     IOReturn blSet(int lvl);
     // N-KEY keyboard (HID 0b05:19b6): backlight (feature report 0x5A) and Slash lighting (0x5D), sent as G-Helper does
     int kbdLevel = -1;
-    int64_t slashSet = -1;
+    int64_t slashSet = -1, auraSet = -1;
     bool hidSeen = false;
     IOReturn hidFeature(const uint8_t *cmd, size_t n, size_t total);
     IOReturn kbdSet(int level);
     IOReturn slashApply(uint32_t packed);
+    IOReturn auraApply(uint32_t packed);
     // hotkeys: Notify (ATKD, 0xFF), codes from _WED (0xFF), handled on a thread call
     IONotifier *atkNotifier = nullptr;
     thread_call_t evCall = nullptr;
@@ -376,6 +378,33 @@ IOReturn AsusWmi::slashApply(uint32_t v)
     return r;
 }
 
+// G-Helper Aura (report 0x5D, 128 bytes): init B9 / "ASUS Tech.Inc." / 05 20 31 00 1A, then B3 <zone 0> <mode> R G B <speed>
+// 00 00 R2 G2 B2, set B5, apply B4. One zone on the GA403; checked on a GA403UM with a test tool (colour and Breathe).
+static const uint8_t kAuraCode[ASUS_AURA_MODE_COUNT] = { 0x00, 0x01, 0x02, 0x03, 0x0A };   // static breathe cycle rainbow strobe
+static const uint8_t kAuraSpeed[3] = { 0xE1, 0xEB, 0xF5 };
+
+IOReturn AsusWmi::auraApply(uint32_t v)
+{
+    uint32_t mode = ASUS_AURA_MODE(v), speed = ASUS_AURA_SPEED(v), rgb = ASUS_AURA_RGB(v);
+    if (mode >= ASUS_AURA_MODE_COUNT || speed > 2 || (v >> 30)) return kIOReturnBadArgument;
+    const uint8_t r = (uint8_t)(rgb >> 16), g = (uint8_t)(rgb >> 8), b = (uint8_t)rgb;
+    struct Pkt { uint8_t n; uint8_t b[15]; };
+    Pkt p[6] = {
+        { 2, { 0x5D, 0xB9 } },
+        { 15, { 0x5D } },
+        { 6, { 0x5D, 0x05, 0x20, 0x31, 0x00, 0x1A } },
+        { 13, { 0x5D, 0xB3, 0x00, kAuraCode[mode], r, g, b, kAuraSpeed[speed], 0x00, 0x00, r, g, b } },
+        { 5, { 0x5D, 0xB5, 0x00, 0x00, 0x00 } },
+        { 2, { 0x5D, 0xB4 } },
+    };
+    memcpy(p[1].b + 1, kAsusMagic, sizeof(kAsusMagic));
+    IOReturn res = kIOReturnSuccess;
+    for (int i = 0; i < 6 && res == kIOReturnSuccess; i++) res = hidFeature(p[i].b, p[i].n, 128);
+    if (res == kIOReturnSuccess) auraSet = v;
+    say("aura mode %u speed %u rgb %06x -> %08x", mode, speed, rgb, res);
+    return res;
+}
+
 // ---------------------------------------------------------------------------------------------------------------------------
 // Hotkeys
 // ---------------------------------------------------------------------------------------------------------------------------
@@ -498,6 +527,8 @@ IOReturn AsusWmi::setValue(int what, int v)
         return kbdSet(v);
     case ASUS_SET_SLASH:
         return v < 0 ? kIOReturnBadArgument : slashApply((uint32_t)v);
+    case ASUS_SET_AURA:
+        return v < 0 ? kIOReturnBadArgument : auraApply((uint32_t)v);
     default:
         return kIOReturnUnsupported;
     }
@@ -588,6 +619,7 @@ void AsusWmi::getState(uint32_t st[ASUS_ST_COUNT])
     st[ASUS_ST_KBD] = kbdLevel >= 0 ? (uint32_t)kbdLevel : ~0u;
     st[ASUS_ST_SLASH] = slashSet >= 0 ? (uint32_t)slashSet : ~0u;
     st[ASUS_ST_HID] = hidSeen ? 1 : 0;
+    st[ASUS_ST_AURA] = auraSet >= 0 ? (uint32_t)auraSet : ~0u;
 }
 
 // getACPITableData() is protected; this type is never instantiated, it only makes the (virtual) call reachable.
@@ -659,13 +691,14 @@ IOReturn AsusWmiUC::externalMethod(uint32_t selector, IOExternalMethodArguments 
     IOReturn r;
     switch (selector) {
     case kAsusUcGetState: {
-        if (!a->structureOutput || a->structureOutputSize < ASUS_ST_COUNT * sizeof(uint32_t)) return kIOReturnBadArgument;
+        if (!a->structureOutput || a->structureOutputSize < ASUS_ST_COUNT_V3 * sizeof(uint32_t)) return kIOReturnBadArgument;
         uint32_t st[ASUS_ST_COUNT];
         IOLockLock(drv->lock);
         drv->getState(st);
         IOLockUnlock(drv->lock);
-        memcpy(a->structureOutput, st, sizeof(st));
-        a->structureOutputSize = sizeof(st);
+        uint32_t n = a->structureOutputSize < sizeof(st) ? a->structureOutputSize : (uint32_t)sizeof(st);   // ABI 3 clients: 27
+        memcpy(a->structureOutput, st, n);
+        a->structureOutputSize = n;
         return kIOReturnSuccess;
     }
     case kAsusUcSet:
@@ -725,8 +758,8 @@ static void buildStatus()
                           gSelf->fanCustom, gSelf->curProfile, gSelf->curCharge);
     uint32_t bl = 0;
     if (gSelf->blGet(&bl)) n += (size_t)snprintf(gStatus + n, sizeof(gStatus) - n, " backlight=%u/%u", bl, gSelf->blMaxLevel);
-    n += (size_t)snprintf(gStatus + n, sizeof(gStatus) - n, " kbd=%d slash=%lld last_key=%02x", gSelf->kbdLevel,
-                          (long long)gSelf->slashSet, gSelf->lastKey);
+    n += (size_t)snprintf(gStatus + n, sizeof(gStatus) - n, " kbd=%d slash=%lld aura=%lld last_key=%02x", gSelf->kbdLevel,
+                          (long long)gSelf->slashSet, (long long)gSelf->auraSet, gSelf->lastKey);
     for (int i = 0; i < 3; i++) {
         static const char *const nm[3] = { "spl", "sppt", "fppt" };
         n += (size_t)snprintf(gStatus + n, sizeof(gStatus) - n, " ppt_%s=%u", nm[i], gSelf->pptSet[i]);
@@ -766,6 +799,7 @@ static int write_sysctl SYSCTL_HANDLER_ARGS
     else if (what == W_FAN_CUSTOM) v = gSelf->fanCustom;
     else if (what == ASUS_SET_KBD) v = gSelf->kbdLevel;
     else if (what == ASUS_SET_SLASH) v = (int)gSelf->slashSet;
+    else if (what == ASUS_SET_AURA) v = (int)gSelf->auraSet;
     else if (what == W_KEY) v = (int)gSelf->lastKey;
     IOLockUnlock(gSelf->lock);
     int e = sysctl_handle_int(oidp, &v, 0, req);
@@ -831,6 +865,7 @@ SYSCTL_PROC(_debug_asuswmi, OID_AUTO, battery, CTLTYPE_STRING | CTLFLAG_RD | CTL
 SYSCTL_PROC(_debug_asuswmi, OID_AUTO, ec_reg, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, W_EC_REG, write_sysctl, "I", "");
 SYSCTL_PROC(_debug_asuswmi, OID_AUTO, kbd, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, ASUS_SET_KBD, write_sysctl, "I", "");
 SYSCTL_PROC(_debug_asuswmi, OID_AUTO, slash, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, ASUS_SET_SLASH, write_sysctl, "I", "");
+SYSCTL_PROC(_debug_asuswmi, OID_AUTO, aura, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, ASUS_SET_AURA, write_sysctl, "I", "");
 SYSCTL_PROC(_debug_asuswmi, OID_AUTO, key, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, W_KEY, write_sysctl, "I", "");
 
 static struct sysctl_oid *const kOids[] = {
@@ -838,7 +873,7 @@ static struct sysctl_oid *const kOids[] = {
     &sysctl__debug_asuswmi_ppt_spl, &sysctl__debug_asuswmi_ppt_sppt, &sysctl__debug_asuswmi_ppt_fppt,
     &sysctl__debug_asuswmi_charge_limit, &sysctl__debug_asuswmi_dumpacpi, &sysctl__debug_asuswmi_probe,
     &sysctl__debug_asuswmi_backlight, &sysctl__debug_asuswmi_battery, &sysctl__debug_asuswmi_ec_reg,
-    &sysctl__debug_asuswmi_kbd, &sysctl__debug_asuswmi_slash, &sysctl__debug_asuswmi_key,
+    &sysctl__debug_asuswmi_kbd, &sysctl__debug_asuswmi_slash, &sysctl__debug_asuswmi_aura, &sysctl__debug_asuswmi_key,
 };
 
 bool AsusWmi::start(IOService *provider)

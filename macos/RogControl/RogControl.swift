@@ -2,7 +2,8 @@
 // Copyright (c) 2026 thanhnndev and contributors
 // RogControl: a small ROG Control Center for macOS on the GA403WM (ROG Zephyrus G14 2025): performance mode (Silent,
 // Performance, Turbo, Manual power limits), battery charge limit, CPU temperature / package power / fan speeds, GPU MUX
-// state. Settings are kept per power source (AC / battery) and applied again when the source changes and at login, as asusd
+// state, NVIDIA GPU status (temperature, load, clocks, video memory; macos/Common/nvgpu.c over the NullMoth NVRM user client).
+// Settings are kept per power source (AC / battery) and applied again when the source changes and at login, as asusd
 // does. Native app window and menu bar popover, SwiftUI, SF Symbols only.
 //
 // Inspired by asusctl / rog-control-center (asus-linux.org, Luke Jones and contributors, MPL-2.0); no code is taken from it.
@@ -31,6 +32,25 @@ struct AsusState {
     var batDesign = 0, batFull = 0, batNow = 0, batState = 0, batRate = 0   // mAh, mAh, mAh, _BST state, mA
     var kbd: Int? = nil, slash: Int? = nil, hid = false                   // ABI 3: keyboard light 0..3, Slash (packed), N-KEY seen
     var lighting = false                                                    // the kext has the keyboard / Slash settings
+    var aura: Int? = nil, auraSupported = false                             // ABI 4: keyboard colour / effect (packed)
+}
+
+// Keyboard colour (asuswmi_abi.h ASUS_AURA_*): mode index, speed 0..2, 0xRRGGBB; one zone on the GA403
+struct Aura: Equatable {
+    static let modes = ["Static", "Breathe", "Colour cycle", "Rainbow", "Strobe"]
+    static let speeds = ["Slow", "Normal", "Fast"]
+    static let presets: [Int] = [0xFFFFFF, 0xFF0000, 0xFF6000, 0xFFC000, 0x00FF00, 0x00FFFF, 0x0040FF, 0xA000FF, 0xFF00A0]
+    var mode = 0, speed = 1, rgb = 0xFFFFFF
+    var packed: Int { (rgb & 0xFFFFFF) | (speed << 24) | (mode << 26) }
+    var usesColour: Bool { mode == 0 || mode == 1 || mode == 4 }           // Colour cycle and Rainbow pick their own
+    var color: Color { Color(red: Double(rgb >> 16 & 0xFF) / 255, green: Double(rgb >> 8 & 0xFF) / 255, blue: Double(rgb & 0xFF) / 255) }
+    init(mode: Int = 0, speed: Int = 1, rgb: Int = 0xFFFFFF) { self.mode = mode; self.speed = speed; self.rgb = rgb }
+    init(packed v: Int) { rgb = v & 0xFFFFFF; speed = (v >> 24) & 3; mode = (v >> 26) & 0xF }
+    static func rgb(of c: Color) -> Int {
+        guard let n = NSColor(c).usingColorSpace(.sRGB) else { return 0xFFFFFF }
+        func b(_ x: CGFloat) -> Int { Int((min(max(x, 0), 1) * 255).rounded()) }
+        return b(n.redComponent) << 16 | b(n.greenComponent) << 8 | b(n.blueComponent)
+    }
 }
 
 // Slash lighting (asuswmi_abi.h ASUS_SLASH_*): mode index, brightness 0..3 (0 = off), interval 0..5
@@ -44,9 +64,9 @@ struct Slash: Equatable {
 }
 
 enum Asus {
-    static let abi: UInt32 = 3
+    static let abi: UInt32 = 4
     enum Sel: UInt32 { case state = 0, set = 1, fanRead = 2, fanWrite = 3, fanReset = 4 }
-    enum What: UInt64 { case profile = 1, spl = 2, sppt = 3, fppt = 4, charge = 5, backlight = 6, kbd = 7, slash = 8 }
+    enum What: UInt64 { case profile = 1, spl = 2, sppt = 3, fppt = 4, charge = 5, backlight = 6, kbd = 7, slash = 8, aura = 9 }
 
     static func open() -> io_connect_t? {
         let svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AsusWmi"))
@@ -76,10 +96,10 @@ enum Asus {
 
     static func state() -> AsusState {
         var s = AsusState()
-        let (kr, b) = call(.state, outCount: 27 * 4)
+        let (kr, b) = call(.state, outCount: 28 * 4)                // an ABI 3 kext answers with 27 words
         guard kr == KERN_SUCCESS, b.count >= 24 * 4 else { return s }
         func w(_ i: Int) -> UInt32 { b.withUnsafeBytes { $0.load(fromByteOffset: i * 4, as: UInt32.self) } }
-        guard w(0) >= 1, w(0) <= abi else { return s }          // ABI 1 / 2 (fewer words) still work
+        guard w(0) >= 1, w(0) <= abi else { return s }          // ABI 1 / 2 / 3 (fewer words) still work
         s.present = true
         s.ac = w(1) & 1 != 0; s.fanCustom = w(1) & 2 != 0
         s.profile = w(2) == ~0 ? nil : Int(w(2)); s.charge = w(3) == ~0 ? nil : Int(w(3))
@@ -94,6 +114,9 @@ enum Asus {
         guard w(0) >= 3, b.count >= 27 * 4 else { return s }
         s.lighting = true
         s.kbd = w(24) == ~0 ? nil : Int(w(24)); s.slash = w(25) == ~0 ? nil : Int(w(25)); s.hid = w(26) != 0
+        guard w(0) >= 4, b.count >= 28 * 4 else { return s }
+        s.auraSupported = true
+        s.aura = w(27) == ~0 ? nil : Int(w(27))
         return s
     }
 
@@ -220,10 +243,12 @@ final class RogModel: ObservableObject {
     @Published var st = AsusState()
     @Published var tctl: Double?
     @Published var watts: Double?
+    @Published var gpu: nvgpu_stat?                          // nil: the NVIDIA driver is not reachable
     @Published var settings = SourceSettings.load(ac: true)
     @Published var charge = UserDefaults.standard.object(forKey: "charge") == nil ? 100 : UserDefaults.standard.integer(forKey: "charge")
     @Published var kbd = UserDefaults.standard.object(forKey: "kbd") == nil ? 2 : UserDefaults.standard.integer(forKey: "kbd")
     @Published var slash = UserDefaults.standard.object(forKey: "slash") == nil ? Slash() : Slash(packed: UserDefaults.standard.integer(forKey: "slash"))
+    @Published var aura = UserDefaults.standard.object(forKey: "aura") == nil ? Aura() : Aura(packed: UserDefaults.standard.integer(forKey: "aura"))
     @Published var message = ""
     @Published var loginEnabled = LoginItem.enabled
     @Published var curve: [UInt8]? = nil
@@ -284,6 +309,8 @@ final class RogModel: ObservableObject {
         st = Asus.state()
         let s = Sensors.read()
         tctl = s.tctl; watts = s.watts
+        var g = nvgpu_stat()
+        gpu = nvgpu_read(&g) == 0 ? g : nil
         if st.present, lastAC != nil, lastAC != st.ac { powerChanged() }
         lastAC = st.ac
         if previousMode != activeMode { loadCurve() }
@@ -325,6 +352,7 @@ final class RogModel: ObservableObject {
     func applyLighting() {
         guard st.lighting else { return }
         var errs: [String] = []
+        if st.auraSupported, Asus.set(.aura, aura.packed) != KERN_SUCCESS { errs.append("keyboard colour refused") }
         if Asus.set(.kbd, kbd) != KERN_SUCCESS { errs.append("keyboard light refused") }
         if Asus.set(.slash, slash.packed) != KERN_SUCCESS { errs.append("Slash refused") }
         st = Asus.state()
@@ -336,6 +364,22 @@ final class RogModel: ObservableObject {
         lightingError = Asus.set(.kbd, v) == KERN_SUCCESS ? "" : "Keyboard light was not applied. Check the keyboard connection."
         message = lightingError.isEmpty ? "keyboard light \(v)" : lightingError
         st = Asus.state()
+    }
+    // a colour picker sends a stream of changes: apply the last one after a short pause
+    private var auraWork: DispatchWorkItem?
+    func setAura(_ a: Aura) {
+        aura = a; UserDefaults.standard.set(a.packed, forKey: "aura")
+        auraWork?.cancel()
+        let w = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            MainActor.assumeIsolated {
+                self.lightingError = Asus.set(.aura, a.packed) == KERN_SUCCESS ? "" : "Keyboard colour was not applied. Check the keyboard connection."
+                self.message = self.lightingError.isEmpty ? "keyboard \(Aura.modes[a.mode].lowercased())" + (a.usesColour ? String(format: " #%06X", a.rgb) : "") : self.lightingError
+                self.st = Asus.state()
+            }
+        }
+        auraWork = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: w)
     }
     func setSlash(_ s: Slash) {
         slash = s; UserDefaults.standard.set(s.packed, forKey: "slash")
@@ -591,7 +635,18 @@ struct RogControls: View {
                 }
             }
             if page == .overview {
-                RogSection(title: "Graphics") { Text(gpuLine).font(.callout).foregroundStyle(.secondary) }
+                RogSection(title: "NVIDIA GPU") {
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack(spacing: 16) {
+                            Stat(symbol: "thermometer.medium", value: gv(m.gpu?.tempC) { "\($0)°" }, label: "GPU temperature")
+                            Stat(symbol: "chart.bar", value: gv(m.gpu?.gfxPct) { "\($0) %" }, label: "GPU load")
+                            Stat(symbol: "speedometer", value: gv(m.gpu?.coreMHz) { "\($0)" }, label: "Core clock · MHz")
+                            Stat(symbol: "memorychip", value: vramText, label: "Video memory · GB")
+                        }
+                        Text(gpuDetail).font(.callout).foregroundStyle(.secondary)
+                        Text(gpuLine).font(.callout).foregroundStyle(.secondary)
+                    }
+                }
             }
             if page == .settings {
                 RogSection(title: "Startup") {
@@ -641,6 +696,7 @@ struct RogControls: View {
         VStack(alignment: .leading, spacing: 8) {
             if m.st.lighting {
                 KeyboardRow(level: m.st.kbd) { m.setKbd($0) }
+                if m.st.auraSupported { AuraRow(aura: m.aura, compact: compact) { m.setAura($0) } }
                 slashControls
             }
         }
@@ -697,6 +753,18 @@ struct RogControls: View {
     var modes: some View {
         ModeRow(active: m.activeMode, ac: m.st.ac, compact: compact) { m.choose($0) }
     }
+    // a GPU field, or "–" when the driver or that query did not answer
+    func gv(_ v: Int32?, _ f: (Int32) -> String) -> String { v.map { $0 == NVGPU_NONE ? "–" : f($0) } ?? "–" }
+    var vramText: String {
+        guard let g = m.gpu, g.vramUsedMB != NVGPU_NONE, g.vramTotalMB > 0 else { return "–" }
+        return String(format: "%.1f / %.0f", Double(g.vramUsedMB) / 1024, Double(g.vramTotalMB) / 1024)
+    }
+    var gpuDetail: String {
+        guard let g = m.gpu else { return "The NVIDIA driver (NVRM) is not reachable." }
+        return [gv(g.pstate) { "P\($0)" }, gv(g.memMHz) { "memory \($0) MHz" }, gv(g.memPct) { "memory load \($0) %" },
+                gv(g.encPct) { "encoder \($0) %" }, gv(g.decPct) { "decoder \($0) %" }].filter { $0 != "–" }.joined(separator: " · ")
+            + " · power draw is not reported by the driver"
+    }
     var gpuLine: String {
         var s = "GPU: "
         let mux = m.st.gpuMux
@@ -707,6 +775,43 @@ struct RogControls: View {
     }
 }
 
+
+// Keyboard colour: preset swatches, a colour well for any colour, the effect and its speed. Takes plain values, like the rows below.
+struct AuraRow: View {
+    let aura: Aura
+    var compact = false
+    let set: (Aura) -> Void
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Text("Colour").font(.system(size: 12)).frame(width: compact ? 52 : 60, alignment: .leading)
+                ForEach(Aura.presets.prefix(compact ? 7 : 9), id: \.self) { c in
+                    Button { var a = aura; a.rgb = c; if !a.usesColour { a.mode = 0 }; set(a) } label: {
+                        Circle().fill(Aura(rgb: c).color).frame(width: 16, height: 16)
+                            .overlay(Circle().strokeBorder(aura.rgb == c && aura.usesColour ? Color.accentColor : Color.primary.opacity(0.25),
+                                                           lineWidth: aura.rgb == c && aura.usesColour ? 2 : 1))
+                    }.buttonStyle(.plain).help(String(format: "#%06X", c))
+                }
+                ColorPicker("", selection: Binding(get: { aura.color }, set: { var a = aura; a.rgb = Aura.rgb(of: $0); if !a.usesColour { a.mode = 0 }; set(a) }),
+                            supportsOpacity: false).labelsHidden().frame(width: 28)
+                Spacer(minLength: 0)
+            }
+            HStack(spacing: 6) {
+                Text("Effect").font(.system(size: 12)).frame(width: compact ? 52 : 60, alignment: .leading)
+                Picker("", selection: Binding(get: { aura.mode }, set: { var a = aura; a.mode = $0; set(a) })) {
+                    ForEach(0..<Aura.modes.count, id: \.self) { Text(Aura.modes[$0]).tag($0) }
+                }.labelsHidden().controlSize(.small).frame(maxWidth: 120)
+                if aura.mode != 0 {
+                    Picker("", selection: Binding(get: { aura.speed }, set: { var a = aura; a.speed = $0; set(a) })) {
+                        ForEach(0..<3, id: \.self) { Text(Aura.speeds[$0]).tag($0) }
+                    }.pickerStyle(.segmented).labelsHidden().controlSize(.small).frame(width: 150)
+                }
+                Spacer(minLength: 0)
+            }
+        }
+        .help("Keyboard colour and effect (one zone)")             // no .id here: rebuilding would detach an open colour panel
+    }
+}
 
 // The mode row and the keyboard-light row take plain values (what is active, which level) instead of reading the model:
 // the popover showed "Active: Silent" next to a Performance highlight that never moved. Their identity follows the value, so a
@@ -808,6 +913,14 @@ struct ContentView: View {
                 quickStat(m.st.present ? "\(m.st.cpuFan)" : "–", "CPU RPM")
                 quickStat(m.st.present ? "\(m.st.gpuFan)" : "–", "GPU RPM")
             }
+            if m.gpu != nil {
+                HStack(spacing: 6) {
+                    quickStat(controls.gv(m.gpu?.tempC) { "\($0)°C" }, "GPU")
+                    quickStat(controls.gv(m.gpu?.gfxPct) { "\($0) %" }, "GPU load")
+                    quickStat(controls.gv(m.gpu?.coreMHz) { "\($0)" }, "Core MHz")
+                    quickStat(controls.vramText, "VRAM GB")
+                }
+            }
             ModeRow(active: m.activeMode, ac: m.st.ac, compact: true) { m.choose($0) }.disabled(!m.st.present)
             HStack {
                 Text("Active: \(m.modeLabel)").font(.caption).foregroundStyle(.secondary)
@@ -838,6 +951,7 @@ struct ContentView: View {
             Divider()
             if m.st.lighting {
                 KeyboardRow(level: m.st.kbd) { m.setKbd($0) }.disabled(!m.st.present)
+                if m.st.auraSupported { AuraRow(aura: m.aura, compact: true) { m.setAura($0) }.disabled(!m.st.present) }
                 PopoverPart(m: m, part: .slash).disabled(!m.st.present)
                 inlineError(m.lightingError)
             } else {
