@@ -52,12 +52,31 @@ void itlmt7925::m3Publish(const char *stage)
 }
 
 // Called by rxParseFrame for every beacon / probe response. `frame` points at the 802.11 header.
-void itlmt7925::m3Capture(const uint8_t *frame, uint32_t len, const char *ssid, uint8_t ch)
+void itlmt7925::m3Capture(const uint8_t *frame, uint32_t len, const char *ssid, uint8_t ch, int8_t rssi)
 {
     if (!m3On || !m3ssid[0] || len < 36 || strcmp(ssid, m3ssid) != 0) return;
-    // prefer 5 GHz; otherwise keep the first one seen
-    if (tgtFound && !(ch > 14 && tgtCh <= 14)) return;
+    if (tgtFound) {
+        const bool same = memcmp(tgtBssid, frame + 16, 6) == 0;
+        if (same) {                                          // the chosen BSS again: only its signal is updated
+            if (rssi) tgtSelRssi = tgtSelRssi ? (int8_t)((tgtSelRssi + rssi) / 2) : rssi;
+            return;
+        }
+        bool take;
+        if (!rssi || !tgtSelRssi) {
+            take = ch > 14 && tgtCh <= 14;                   // no signal reading: prefer 5 GHz, else keep the first one seen
+        } else if (ch > 14 && tgtCh <= 14) {
+            take = rssi >= -70 && rssi + 15 >= tgtSelRssi;   // 5 GHz only when it is usable and not much weaker
+        } else if (ch <= 14 && tgtCh > 14) {
+            take = (tgtSelRssi < -70 || tgtSelRssi + 15 < rssi) && rssi > tgtSelRssi;   // leave a weak 5 GHz BSS
+        } else {
+            take = rssi > tgtSelRssi + 6;                    // same band: clearly stronger only (no flapping)
+        }
+        if (!take) return;
+        m3log("target: %02x:%02x:%02x ch %u %d dBm replaces ch %u %d dBm", frame[19], frame[20], frame[21], ch, rssi, tgtCh,
+              tgtSelRssi);
+    }
     tgtFound = true;
+    tgtSelRssi = rssi;
     memcpy(tgtBssid, frame + 16, 6);
     tgtCh = ch;
     tgtBcnInt = (uint16_t)(frame[32] | (frame[33] << 8));

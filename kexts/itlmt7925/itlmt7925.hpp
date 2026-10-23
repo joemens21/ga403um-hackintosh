@@ -144,7 +144,7 @@ private:
     void m3log(const char *fmt, ...);
     void m3Publish(const char *stage);
     int  m3Run();
-    void m3Capture(const uint8_t *frame, uint32_t len, const char *ssid, uint8_t ch);
+    void m3Capture(const uint8_t *frame, uint32_t len, const char *ssid, uint8_t ch, int8_t rssi);
     int  m3Cmd(uint8_t cid, const void *payload, size_t plen, const char *name);
     int  m3HwPrep();
     void ctlPoll();                          // link loop: take run-time control requests (setProperties)
@@ -378,6 +378,7 @@ private:
     void ethDeliver(const uint8_t *frame, uint32_t len);
     // target AP, captured from a beacon / probe response during the scan
     bool tgtFound = false;
+    int8_t tgtSelRssi = 0;                    // signal of the BSS m3Capture chose (0 = not measured)
     uint8_t tgtBssid[6] = {0};
     uint8_t tgtCh = 0;
     uint16_t tgtCap = 0, tgtBcnInt = 0;
