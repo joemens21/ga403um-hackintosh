@@ -149,6 +149,9 @@ func brightnessKey(_ up: Bool) {
     cgBrightnessKey(up)
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
         if let after = pluginSets(), after > before { return }
+        // already at the end the key points to: macOS had nothing to change
+        var cur: UInt32 = 0
+        if edpbl_open() == 0, edpbl_get(&cur) == 1, up ? cur >= UInt32(EDPBL_MAX) : cur <= blLevel(1) { return }
         log("brightness key not taken by macOS")
         brightnessDirect(up)
     }
