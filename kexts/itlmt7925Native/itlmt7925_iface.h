@@ -19,6 +19,7 @@
 // Appends "; <text>" to the registry property "itlmt_native_trace" of `e` (cap 480 bytes). IOLog output of third-party kexts was
 // not found in the collected logs of stage A/B, a registry property survives and is read with `ioreg -l`.
 void itlmtTrace(IORegistryEntry *e, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+void itlmtAssocLog(IORegistryEntry *e, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 
 // Call recorder: one table of (kind, id, up to 3 caller addresses) -> count, published as the registry property
 // "itlmt_native_calls" of `e` whenever an entry is new or its count reaches a power of two, so it survives panic-free runs and

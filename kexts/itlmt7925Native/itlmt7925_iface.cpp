@@ -57,6 +57,33 @@ inline void rel(OSObject *o)
 
 }
 
+// Join log: the last join requests and what became of them, in their own registry property (itlmt_native_assoc) so the startup
+// trace cannot crowd them out. Oldest entries are dropped once it passes 1400 characters.
+void itlmtAssocLog(IORegistryEntry *e, const char *fmt, ...)
+{
+    if (!e) return;
+    char add[200];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(add, sizeof(add), fmt, ap);
+    va_end(ap);
+    char buf[1700];
+    buf[0] = 0;
+    OSObject *o = e->copyProperty("itlmt_native_assoc");
+    if (OSString *old = OSDynamicCast(OSString, o)) strlcpy(buf, old->getCStringNoCopy(), sizeof(buf));
+    if (o) o->release();
+    if (buf[0]) strlcat(buf, "; ", sizeof(buf));
+    strlcat(buf, add, sizeof(buf));
+    size_t len = strlen(buf), cut = 0;
+    while (len - cut > 1400) {                               // drop whole entries from the front
+        size_t i = cut;
+        while (i + 1 < len && !(buf[i] == ';' && buf[i + 1] == ' ')) i++;
+        if (i + 1 >= len) break;
+        cut = i + 2;
+    }
+    e->setProperty("itlmt_native_assoc", buf + cut);
+}
+
 void itlmtTrace(IORegistryEntry *e, const char *fmt, ...)
 {
     if (!e) return;
@@ -1106,16 +1133,30 @@ IOReturn itlmt7925WifiInterface::setWCL_ASSOCIATE(apple80211AssocCandidates *d)
     if (ssidLen == 0 || ssidLen > 32) return kIOReturnBadArgument;
     // no key at all and only open beacons for the SSID: an open network (the core checks PRIVACY again before it associates)
     const bool open = cipher == 0 && keyLen == 0 && ssidIsOpen(b + 0x20, ssidLen);
-    if (!((cipher == 6 || cipher == 9) && keyLen == 32)) {
-        // no passphrase key in this request (open, 802.1X, SAE): record the parts of the layout that are not known yet, for the
-        // enterprise work (+0x00..+0x1b before the SSID, +0x40..+0x5f the key header and the start of the key area)
-        char h0[2 * 0x1c + 1], h1[2 * 0x20 + 1];
-        for (int i = 0; i < 0x1c; i++) snprintf(h0 + 2 * i, 3, "%02x", b[i]);
-        for (int i = 0; i < 0x20; i++) snprintf(h1 + 2 * i, 3, "%02x", b[0x40 + i]);
-        itlmtTrace(ctl, "assoc:raw00 %s", h0);
-        itlmtTrace(ctl, "assoc:raw40 %s", h1);
+    // Every join request goes to the join log with the fields AppleBCMWLANCore::setWCL_ASSOCIATE / AppleBCMWLANJoinAdapter::
+    // performJoin read (0xffffff8001608554 / 0xffffff80015845b2, 24H32): auth type lower +0x10, upper +0x14 / +0x18, the RSN
+    // element the supplicant built (+0xd4 u16 length, +0xd6 bytes), flags +0x1e0, auth context +0x210. Never the key bytes.
+    {
+        uint32_t lower = 0, upper = 0, upper2 = 0, actx = 0;
+        uint16_t rsnLen = 0, flags = 0;
+        memcpy(&lower, b + 0x10, 4);
+        memcpy(&upper, b + 0x14, 4);
+        memcpy(&upper2, b + 0x18, 4);
+        memcpy(&rsnLen, b + 0xd4, 2);
+        memcpy(&flags, b + 0x1e0, 2);
+        memcpy(&actx, b + 0x210, 4);
+        itlmtAssocLog(ctl, "req ssidLen=%u lower=%x upper=%x/%x cipher=%u keyLen=%u flags=%04x actx=%x", ssidLen, lower, upper,
+                      upper2, cipher, keyLen, flags, actx);
+        char h[2 * 48 + 1];
+        uint32_t n = rsnLen < 48 ? rsnLen : 48;
+        h[0] = 0;
+        for (uint32_t i = 0; i < n; i++) snprintf(h + 2 * i, 3, "%02x", b[0xd6 + i]);
+        itlmtAssocLog(ctl, "rsn(%u)=%s", rsnLen, h);
     }
-    if (!open && !((cipher == 6 || cipher == 9) && keyLen == 32)) return kIOReturnUnsupported;   // SAE / enterprise: not implemented
+    if (!open && !((cipher == 6 || cipher == 9) && keyLen == 32)) {                               // SAE / enterprise: not implemented
+        itlmtAssocLog(ctl, "-> unsupported");
+        return kIOReturnUnsupported;
+    }
     ItlNativeJoin j;
     bzero(&j, sizeof(j));
     j.version = open ? 2 : 1;
@@ -1125,7 +1166,8 @@ IOReturn itlmt7925WifiInterface::setWCL_ASSOCIATE(apple80211AssocCandidates *d)
     else memcpy(j.pmk, b + 0x50, 32);
     IOReturn r = core->callPlatformFunction(ITL_NATIVE_JOIN, false, &j, nullptr, nullptr, nullptr);
     bzero(&j, sizeof(j));
-    if (r != kIOReturnSuccess) { itlmtTrace(ctl, "assoc:core join=%x", r); return r; }
+    if (r != kIOReturnSuccess) { itlmtTrace(ctl, "assoc:core join=%x", r); itlmtAssocLog(ctl, "-> core join=%x", r); return r; }
+    itlmtAssocLog(ctl, "-> %s join started", open ? "open" : "psk");
     ItlNativeStatus st;
     bzero(&st, sizeof(st));
     queryStatus(&st);
@@ -1146,6 +1188,7 @@ IOReturn itlmt7925WifiInterface::setWCL_LEAVE_NETWORK(apple80211_leave_network *
     if (!core || !bound) return kIOReturnNotReady;
     IOReturn r = core->callPlatformFunction(ITL_NATIVE_LEAVE, false, nullptr, nullptr, nullptr, nullptr);
     itlmtTrace(ctl, "assoc:leave=%x", r);
+    itlmtAssocLog(ctl, "leave=%x", r);
     return kIOReturnSuccess;
 }
 
@@ -1410,6 +1453,7 @@ void itlmt7925WifiInterface::finishJoin(const ItlNativeStatus &st, bool ok)
         postEvent(kEventConnect, done, sizeof(done));
     }
     itlmtTrace(ctl, "assoc:result ok=%u stage=%u", ok, st.failStage);
+    itlmtAssocLog(ctl, "result ok=%u stage=%u", ok, st.failStage);
 }
 
 // Event 0xd8 (WCLNetManager::linkStatusInd): +0 ether_addr bssid, +6 u8 link up (0 = down), +8 u32 down reason
