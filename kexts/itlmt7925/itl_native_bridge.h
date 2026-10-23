@@ -53,16 +53,22 @@ struct ItlNativeNets {
 // ITL_NATIVE_JOIN, p1 = ItlNativeJoin*: connect to `ssid` with a ready pairwise master key (the supplicant of Apple's design
 // runs in userland; the 4-way handshake still runs in the core). The core wipes its copy; the caller wipes this one.
 // Version 2 adds `open`: an open network (no RSN, no handshake, pmk unused). A version 1 core refuses version 2.
+// Version 3 adds `eap`: an 802.1X network (RSN with AKM 1, no PMK yet: the EAP exchange runs in userland over the link, the
+// port stays unauthorised until the 4-way handshake). A version 2 core refuses version 3.
 struct ItlNativeJoin {
     uint32_t version;
     uint8_t ssidLen;
     char ssid[33];
     uint8_t pmk[32];
     uint8_t open;
+    uint8_t eap;
 };
 #define ITL_NATIVE_JOIN "itlmt-native-join-v1"
 // ITL_NATIVE_LEAVE, p1 unused: leave the network / abort a join in progress.
 #define ITL_NATIVE_LEAVE "itlmt-native-leave-v1"
+// ITL_NATIVE_PMK, p1 = uint8_t[32]: the pairwise master key of an 802.1X join (version 3, `eap`), from the supplicant after EAP
+// succeeded (APPLE80211_IOC_CIPHER_KEY). The core runs the 4-way handshake with it on the open link and wipes its copy after.
+#define ITL_NATIVE_PMK "itlmt-native-pmk-v1"
 
 // ITL_NATIVE_STATUS, p1 = ItlNativeStatus*: link / join state and the current BSS.
 enum { ITL_NATIVE_IDLE = 0, ITL_NATIVE_CONNECTING = 1, ITL_NATIVE_UP = 2, ITL_NATIVE_FAILED = 3 };
@@ -89,5 +95,7 @@ struct ItlNativeStatus {
     uint8_t fastActive, fastNss, fastHe, fastBw;
     uint8_t htMcs[10];
     uint16_t vhtMcs, heMcs;
+    // 802.1X link (appended with ITL_NATIVE_PMK): 0 not an 802.1X link, 1 unauthorised (EAP / handshake running), 2 authorised
+    uint8_t eapState;
 };
 #define ITL_NATIVE_STATUS "itlmt-native-status-v1"

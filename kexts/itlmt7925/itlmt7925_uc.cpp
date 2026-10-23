@@ -273,14 +273,16 @@ IOReturn itlmt7925::nativeScanReq(uint32_t *started)
 IOReturn itlmt7925::nativeJoin(const ItlNativeJoin *j)
 {
     if (!m3On || !cmdLock || !wstate[0]) return kIOReturnNotReady;
-    if (!j || (j->version != 1 && j->version != 2) || !j->ssidLen || j->ssidLen > 32) return kIOReturnBadArgument;
+    if (!j || j->version < 1 || j->version > 3 || !j->ssidLen || j->ssidLen > 32) return kIOReturnBadArgument;
     const bool open = j->version >= 2 && j->open;
+    const bool eap = !open && j->version >= 3 && j->eap;
     IOLockLock(cmdLock);
     bzero(&reqNet, sizeof(reqNet));
     memcpy(reqNet.ssid, j->ssid, j->ssidLen);
-    if (!open) memcpy(reqNet.pmk, j->pmk, sizeof(reqNet.pmk));
-    reqNet.hasPmk = !open;
+    if (!open && !eap) memcpy(reqNet.pmk, j->pmk, sizeof(reqNet.pmk));
+    reqNet.hasPmk = !open && !eap;
     reqNet.open = open;
+    reqNet.eap = eap;
     reqNet.native = true;
     njFail = 0;
     njState = ITL_NATIVE_CONNECTING;
@@ -288,6 +290,46 @@ IOReturn itlmt7925::nativeJoin(const ItlNativeJoin *j)
     cmdBits = (cmdBits & ~(uint32_t)CMD_DISCONNECT) | (uint32_t)CMD_JOIN;
     IOLockUnlock(cmdLock);
     return kIOReturnSuccess;
+}
+
+// The supplicant's key for the current 802.1X link (unauthorised, waiting for it); m3Link() runs the handshake on its next pass.
+IOReturn itlmt7925::nativePmk(const uint8_t *pmk)
+{
+    if (!pmk) return kIOReturnBadArgument;
+    if (!m3eap || !m3linkUp) return kIOReturnNotReady;
+    if (m3eapAuth) return kIOReturnSuccess;                  // a re-key of an authorised link: not handled yet (phase 3b)
+    memcpy(m3pmk, pmk, sizeof(m3pmk));
+    __atomic_store_n(&m3eapPmk, true, __ATOMIC_RELEASE);
+    eapLog("pmk from the supplicant (eapol rx before it: eap=%u key=%u)", stEapRx, stEapKeyRx);
+    return kIOReturnSuccess;
+}
+
+// 802.1X log: what happened on the last 802.1X links, in its own registry property (wifi-8021x-log) so that the connection
+// log (m3-log, which stops when full) cannot crowd it out. Oldest entries are dropped past 1400 characters.
+void itlmt7925::eapLog(const char *fmt, ...)
+{
+    char add[160];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(add, sizeof(add), fmt, ap);
+    va_end(ap);
+    char buf[1700];
+    buf[0] = 0;
+    OSObject *o = copyProperty("wifi-8021x-log");
+    if (OSString *old = OSDynamicCast(OSString, o)) strlcpy(buf, old->getCStringNoCopy(), sizeof(buf));
+    if (o) o->release();
+    char line[180];
+    snprintf(line, sizeof(line), "%u.%03u %s", nowMs() / 1000, nowMs() % 1000, add);
+    if (buf[0]) strlcat(buf, "; ", sizeof(buf));
+    strlcat(buf, line, sizeof(buf));
+    size_t len = strlen(buf), cut = 0;
+    while (len - cut > 1400) {
+        size_t i = cut;
+        while (i + 1 < len && !(buf[i] == ';' && buf[i + 1] == ' ')) i++;
+        if (i + 1 >= len) break;
+        cut = i + 2;
+    }
+    setProperty("wifi-8021x-log", buf + cut);
 }
 
 // Whole elements only, at most `max` bytes.
@@ -341,6 +383,7 @@ void itlmt7925::nativeStatus(ItlNativeStatus *s)
     s->fastBw = 0;
     bzero(s->htMcs, sizeof(s->htMcs));
     s->vhtMcs = s->heMcs = 0xffff;
+    s->eapState = (m3eap && m3linkUp) ? (m3eapAuth ? 2 : 1) : 0;
     if (s->fastActive) {
         const uint8_t nss = fastNss > ITL_CAPS_MAX_NSS ? (uint8_t)ITL_CAPS_MAX_NSS : fastNss;
         s->fastNss = nss;

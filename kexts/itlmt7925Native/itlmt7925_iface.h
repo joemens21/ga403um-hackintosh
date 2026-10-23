@@ -91,6 +91,8 @@ private:
     void postLinkStatus(const uint8_t *bssid, bool up, uint32_t reason);
     void postEvent(uint32_t code, void *data, size_t length);
     bool queryStatus(ItlNativeStatus *st);
+    bool eapWatch = false;                  // an 802.1X join is up unauthorised: post 0xa when the core authorises it (rxLock)
+    uint32_t eapTicks = 0;
     ItlNativeAp *snap = nullptr;            // ITL_NATIVE_AP_MAX entries: scratch for ITL_NATIVE_NETS (tick thread only)
     bool scanActive = false, scanImmediate = false, joinActive = false;
     uint32_t scanGenAtReq = 0, scanTicks = 0, joinSeq = 0, joinTicks = 0, controlTicks = 0, scanTraced = 0;

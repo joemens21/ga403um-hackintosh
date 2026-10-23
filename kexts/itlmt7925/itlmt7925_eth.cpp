@@ -298,6 +298,10 @@ IOReturn itlmt7925::callPlatformFunction(const OSSymbol *name, bool wait, void *
         if (!nativeMode) return kIOReturnNotReady;
         return nativeJoin((const ItlNativeJoin *)p1);
     }
+    if (name->isEqualTo(ITL_NATIVE_PMK)) {
+        if (!nativeMode) return kIOReturnNotReady;
+        return nativePmk((const uint8_t *)p1);
+    }
     if (name->isEqualTo(ITL_NATIVE_LEAVE)) {
         if (!nativeMode) return kIOReturnNotReady;
         IOReturn r = ucDisconnect();

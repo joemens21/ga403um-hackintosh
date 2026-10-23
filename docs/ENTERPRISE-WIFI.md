@@ -1,9 +1,12 @@
 # Enterprise Wi-Fi (802.1X) on the native MT7925 driver
 
-Status 2026-10-22: **phase 0 done** (request layout and a captured eduroam join, below); no 802.1X code yet. Target networks:
-Rutgers `eduroam` and `RUWireless Secure` (WPA2-Enterprise, AES-CCMP, EAP-TTLS / PAP, server `*.ruw.rutgers.edu`; Rutgers
-documents them as WPA2, the beacons show `8021x ft_8021x sha256_8021x`, MFP capable, not required). Branch `wifi/gaps-24h32`,
-macOS 15.8.1 (24H32). Same ground rules as [NATIVE-WIFI.md](NATIVE-WIFI.md): layouts only from Apple's binaries, no GPL source.
+Status 2026-10-22: **WPA2-Enterprise works** (Rutgers `eduroam`, EAP-TTLS / PAP, AKM 1, CCMP): association, EAP through
+eapolclient, PMK from `APPLE80211_IOC_CIPHER_KEY`, the core's 4-way handshake, eapolclient `State=Authenticated`, DHCP.
+Not handled yet: re-authentication / PTK re-key on an authorised link (EAP frames after authorisation are dropped, see "Open
+items"), AKM 5, PMF. Target networks: Rutgers `eduroam` and `RUWireless Secure` (WPA2-Enterprise, AES-CCMP, EAP-TTLS / PAP,
+server `*.ruw.rutgers.edu`; the beacons show `8021x ft_8021x sha256_8021x`, MFP capable, not required). Branch
+`wifi/gaps-24h32`, macOS 15.8.1 (24H32). Same ground rules as [NATIVE-WIFI.md](NATIVE-WIFI.md): layouts only from Apple's
+binaries, no GPL source.
 
 ## How the work is split (Apple's model)
 
@@ -82,3 +85,28 @@ eapolclient). The PSK and open paths must stay unchanged; every new branch is en
 | macOS checks that the association used its RSN element (AKM 5) | if the AKM 1 element is rejected, phase 4 moves forward |
 | EAPOL to the host before link-up breaks the Skywalk data path assumptions | only 0x888e is passed; the PSK path keeps its current order |
 | The RADIUS server rejects the identity / certificate | that is configuration (JoinNow profile), visible in the eapolclient log, not the driver |
+
+## What it took (2026-10-22, phases 1 to 3 in one branch)
+
+| Piece | Where | Source of the fact |
+|---|---|---|
+| upper auth 0x800 + no key = 802.1X join, join struct version 3 `eap` | `itlmt7925_iface.cpp` setWCL_ASSOCIATE | captured requests (table above) |
+| association with RSN AKM 1, PRIVACY, link up unauthorised, watchdog off | core `m3Run1` / `m3Assoc` | 802.11 |
+| EAP (EAPOL type != 3) to the host, only 0x888e transmitted until authorised | core `m3RxData` / `ethTx` | 802.1X port model |
+| `setCIPHER_KEY`: +4 length, +8 cipher, +0xc index, +0xe flags, +0x10 key; cipher 9, 32 bytes = PMK | native | `AppleBCMWLANCore::setCIPHER_KEY` 0xffffff800160dc76 log format |
+| PMK -> core (`ITL_NATIVE_PMK`), handshake in the link loop, M2 RSN element with AKM 1 | core | existing `m3Handshake` |
+| "handshake complete" to eapolclient = `messageClients(kIOMessageServicePropertyChange)` on the native interface | native `pollControl` | eapolclient: `IOServiceAddInterestNotification(IOGeneralInterest)` on the 2nd parent of en4, callback compares 0xe0000130 |
+
+Dead ends worth remembering: event 0xa is APPLE80211_M scan done (`AppleBCMWLANCore::scanComplete`), not a handshake event;
+`handlePSKEvent` posts 0x4c (40-byte status) for the firmware supplicant, which eapolclient does not use. Disconnect reason 23
+from the AP before any EAPOL-Key = the RADIUS server rejected the login (eduroam needs `NetID@rutgers.edu`).
+
+Logs: core `wifi-8021x-log` (association, PMK, handshake summary, authorisation, link end), native `itlmt_native_assoc`
+(requests, cipher keys, the property-change message), eapolclient `log show --info --predicate 'process == "eapolclient"'`.
+
+## Open items
+
+* Re-authentication on an authorised link: the core drops EAP frames once `m3eapAuth` is set and does not run a second 4-way
+  handshake (PTK re-key) or a group key handshake on an 802.1X link; a RADIUS session timeout will end in a disconnect and a
+  fresh join.
+* AKM 5 (the supplicant's choice) and PMF, phase 4.

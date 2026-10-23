@@ -165,6 +165,10 @@ private:
     uint8_t rocTok = 0, rocStatus = 0xff;
     uint8_t m3cipher = 0;                    // 0 = open, 4 = CCMP (BSS_INFO sec TLV)
     bool m3open = false;                     // the selected network is an open one: no RSN element, no handshake
+    bool m3eap = false;                      // the selected network is 802.1X: RSN with AKM 1, EAP over the link, then keys
+    bool m3eapAuth = false;                  // 802.1X: port authorised (keys installed); before that only EAPOL passes
+    volatile bool m3eapPmk = false;          // 802.1X: m3pmk holds the supplicant's key, the link loop runs the handshake
+    uint32_t stEapRx = 0, stEapTx = 0, stEapKeyRx = 0, stEapBlocked = 0;
     uint8_t apSupp = 0, apBasic = 0;         // OFDM rate bitmaps (6,9,12,18,24,36,48,54 -> bit 0..7)
     uint8_t apCck = 0, apBasicCck = 0;       // 2.4 GHz CCK rate bitmaps (1,2,5.5,11 -> bit 0..3)
     uint8_t apRsn[64] = {0};
@@ -396,7 +400,7 @@ private:
     // ---- runtime control: command mailbox, supervisor loop, status for the menu bar app (itlmt7925_uc.cpp) ----
     enum { CMD_SCAN = 1, CMD_JOIN = 2, CMD_DISCONNECT = 4 };
     // hasPmk: `pmk` is the ready pairwise master key (native Wi-Fi: userland's supplicant derived it), psk is empty then
-    struct Net { char ssid[33]; char psk[72]; bool hasPmk; bool native; uint8_t pmk[32]; bool open; };
+    struct Net { char ssid[33]; char psk[72]; bool hasPmk; bool native; uint8_t pmk[32]; bool open; bool eap; };
     IOLock *cmdLock = nullptr;
     volatile uint32_t cmdBits = 0;
     Net reqNet = {};                         // the network of the last join command (under cmdLock)
@@ -421,6 +425,8 @@ private:
     volatile uint32_t njState = 0, njSeq = 0, njFail = 0;
     IOReturn nativeScanReq(uint32_t *started);
     IOReturn nativeJoin(const struct ItlNativeJoin *j);
+    IOReturn nativePmk(const uint8_t *pmk);
+    void eapLog(const char *fmt, ...) __attribute__((format(printf, 2, 3)));
     void nativeStatus(struct ItlNativeStatus *s);
     void nativeNets(struct ItlNativeNets *n);
     volatile bool m3lost = false;            // the AP sent deauthentication / disassociation, or went silent
