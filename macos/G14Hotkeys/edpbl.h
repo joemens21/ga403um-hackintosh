@@ -4,6 +4,7 @@
 // NVRM user client. NullMoth 2.5.3 (RM 615.78.08) allows DP_AUXCH_CTRL only for root clients.
 #pragma once
 #include <stdint.h>
+#include <IOKit/hidsystem/ev_keymap.h>    // NX_KEYTYPE_BRIGHTNESS_*, for the Swift side
 
 #define EDPBL_MAX 0x7FF   // DPCD 0x724 = 0x0b: 11-bit level
 

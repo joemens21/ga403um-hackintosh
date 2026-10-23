@@ -7,7 +7,7 @@
 //   report 0x5A 0xC5 / 0xC4   Fn+F2 / Fn+F3   keyboard light down / up    -> sysctl debug.asuswmi.kbd (0..3)
 //   report 0x5A 0xB3          Fn+F4           AURA: Slash on / off        -> sysctl debug.asuswmi.slash (brightness 0 <-> 2)
 //   report 0x5A 0x7C          Fn+F9           mic mute                    -> default input: mute, or volume 0 / restore
-//   report 0x5A 0x10 / 0x20   Fn+F7 / Fn+F8   OLED brightness down / up   -> eDP DPCD level (edpbl.c), 16 steps
+//   report 0x5A 0x10 / 0x20   Fn+F7 / Fn+F8   OLED brightness down / up   -> system brightness keys, else DPCD (edpbl.c)
 //   report 0x02 0xE2          Fn+F1           speaker mute (consumer)     -> default output: mute, or volume 0 / restore
 //   report 0x5A 0x38          ROG key         ignored for now
 // 0x5A 0x00 is the key release. Built-in Output (AppleALC) has no mute control, hence the volume fallback.
@@ -15,6 +15,7 @@ import Foundation
 import IOKit.hid
 import CoreAudio
 import AudioToolbox
+import AppKit
 
 func log(_ s: String) {
     let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd HH:mm:ss"
@@ -88,25 +89,69 @@ func toggleMute(input: Bool) {
     log("\(what) volume=\(v) -> \(r)")
 }
 
-// MARK: OLED brightness (edpbl.c)
+// MARK: OLED brightness
 
-// 16 steps on a 2.2 gamma curve over the 11-bit DPCD level, kept in root's defaults. The panel falls back to its default mode
-// (0x721 = 1) at boot and may after display sleep, so a 5 s check puts the level back whenever it differs.
-var blStep = UserDefaults.standard.object(forKey: "brightnessStep") as? Int ?? 16
+// With the NVRMAuxBacklight plugin (sysctl debug.nvauxbl) macOS owns the brightness: Fn+F7/F8 post the system brightness keys,
+// so the slider, the on-screen indicator and the panel move together. If macOS does not act on the key within
+// 0.6 s (no new plugin write), or the plugin is not there, the key steps the panel directly over DPCD (edpbl.c), 16 steps on a
+// 2.2 gamma curve over the 11-bit level. The panel falls back to its default mode (0x721 = 1) at boot and may after display
+// sleep; the 5 s check puts the last level back only then, and otherwise just remembers the level (kept in root's defaults).
+var blLast = UserDefaults.standard.object(forKey: "brightnessLevel") as? UInt32 ?? UInt32(EDPBL_MAX)
 
 func blLevel(_ step: Int) -> UInt32 { max(8, UInt32((Double(EDPBL_MAX) * pow(Double(step) / 16, 2.2)).rounded())) }
 
+func blRemember(_ lvl: UInt32) {
+    if lvl == blLast { return }
+    blLast = lvl
+    UserDefaults.standard.set(lvl, forKey: "brightnessLevel")
+}
+
 @discardableResult
-func blApply() -> Bool {
+func blApply(_ lvl: UInt32) -> Bool {
     if edpbl_open() != 0 { return false }
-    if edpbl_set(blLevel(blStep)) != 0 { edpbl_close(); return false }
+    if edpbl_set(lvl) != 0 { edpbl_close(); return false }
+    blRemember(lvl)
     return true
 }
 
-func brightnessStep(_ up: Bool) {
-    blStep = max(1, min(16, blStep + (up ? 1 : -1)))
-    UserDefaults.standard.set(blStep, forKey: "brightnessStep")
-    log("brightness step \(blStep) level \(blLevel(blStep)) -> \(blApply() ? "ok" : "failed")")
+// the plugin's write counter, nil without the plugin
+func pluginSets() -> Int? {
+    var buf = [CChar](repeating: 0, count: 512), n = buf.count
+    guard sysctlbyname("debug.nvauxbl", &buf, &n, nil, 0) == 0,
+          let r = String(cString: buf).range(of: #"sets=(\d+)"#, options: .regularExpression) else { return nil }
+    return Int(String(cString: buf)[r].dropFirst(5))
+}
+
+func brightnessDirect(_ up: Bool) {
+    var cur: UInt32 = 0
+    if edpbl_open() != 0 { log("brightness: panel not reachable"); return }
+    if edpbl_get(&cur) != 1 { cur = blLast }
+    let step = (0...16).min { abs(Int(blLevel($0)) - Int(cur)) < abs(Int(blLevel($1)) - Int(cur)) } ?? 16
+    let lvl = blLevel(max(1, min(16, step + (up ? 1 : -1))))
+    log("brightness direct level \(cur) -> \(lvl) -> \(blApply(lvl) ? "ok" : "failed")")
+}
+
+// the system brightness key (NX_KEYTYPE_BRIGHTNESS_UP / _DOWN) as a system-defined event through the window server's HID
+// tap; needs Accessibility. (IOHIDPostEvent is refused for this daemon with kIOReturnNotPrivileged even with Accessibility.)
+func cgBrightnessKey(_ up: Bool) {
+    let key = up ? NX_KEYTYPE_BRIGHTNESS_UP : NX_KEYTYPE_BRIGHTNESS_DOWN
+    for down in [true, false] {
+        let ev = NSEvent.otherEvent(with: .systemDefined, location: .zero,
+                                    modifierFlags: NSEvent.ModifierFlags(rawValue: down ? 0xa00 : 0xb00), timestamp: 0,
+                                    windowNumber: 0, context: nil, subtype: 8,
+                                    data1: Int(key) << 16 | (down ? 0xa : 0xb) << 8, data2: -1)
+        ev?.cgEvent?.post(tap: .cghidEventTap)
+    }
+}
+
+func brightnessKey(_ up: Bool) {
+    guard let before = pluginSets() else { brightnessDirect(up); return }
+    cgBrightnessKey(up)
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+        if let after = pluginSets(), after > before { return }
+        log("brightness key not taken by macOS")
+        brightnessDirect(up)
+    }
 }
 
 func blKeep() {
@@ -114,9 +159,8 @@ func blKeep() {
     var lvl: UInt32 = 0
     let mode = edpbl_get(&lvl)
     if mode < 0 { edpbl_close(); return }                                // display asleep, or the RM client went stale
-    if mode == 0 || lvl != blLevel(blStep) {
-        log("brightness reapplied (mode \(mode) level \(lvl)) -> \(blApply() ? "ok" : "failed")")
-    }
+    if mode == 1 { blRemember(lvl); return }
+    log("panel in its own mode: level \(blLast) restored -> \(blApply(blLast) ? "ok" : "failed")")
 }
 
 // MARK: N-KEY input reports
@@ -142,8 +186,8 @@ func handle(_ id: UInt32, _ r: UnsafeMutablePointer<UInt8>, _ len: Int) {
         case 0xC5: kbdStep(false)
         case 0xB3: slashToggle()
         case 0x7C: toggleMute(input: true)
-        case 0x10: brightnessStep(false)
-        case 0x20: brightnessStep(true)
+        case 0x10: brightnessKey(false)
+        case 0x20: brightnessKey(true)
         default: log(String(format: "key 5a %02x ignored", r[1]))
         }
     } else if id == 0x02 && len >= 3 && r[1] == 0xE2 && r[2] == 0x00 {

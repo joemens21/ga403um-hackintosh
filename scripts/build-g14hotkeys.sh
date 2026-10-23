@@ -2,9 +2,11 @@
 # SPDX-License-Identifier: BSD-3-Clause-Clear
 # Copyright (c) 2026 thanhnndev and contributors
 # Builds G14Hotkeys (Fn keys sent as N-KEY HID reports: keyboard light, AURA / Slash, mic and speaker mute; OLED brightness
-# over DPCD) into build/G14Hotkeys. Then `sudo bash scripts/build-g14hotkeys.sh --install` (no rebuild as root) copies it to
-# /usr/local/bin and starts it at every boot as a root LaunchDaemon (restarted if it exits). Every new build needs Input
-# Monitoring again: remove /usr/local/bin/g14-hotkeys there and add it back (ad-hoc signature, the grant follows the binary).
+# through the system brightness keys, else over DPCD) into build/G14Hotkeys. Then
+# `sudo bash scripts/build-g14hotkeys.sh --install` (no rebuild as root) copies it to /usr/local/bin and starts it at
+# every boot as a root LaunchDaemon (restarted if it exits). Every new build needs Input Monitoring and Accessibility again
+# (Accessibility: posting the brightness keys): remove /usr/local/bin/g14-hotkeys in both lists and add it back (ad-hoc
+# signature, the grant follows the binary; AMFI off means macOS never asks).
 # Log: /var/log/g14-hotkeys.log. Remove: sudo launchctl bootout system/com.itlmt7925.G14Hotkeys
 set -euo pipefail
 cd "$(dirname "$0")/.."
