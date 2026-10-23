@@ -83,6 +83,18 @@ static bool supportedCpu()
     return (b & (1u << 27)) != 0; // AMD CPPC full-MSR support
 }
 
+// GA403UM patch: HWCR[CpbDis] (bit 25) is architectural on AMD family 17h+; allow only the boost switch on Zen 3/4 (family 0x19)
+static bool boostCapableCpu()
+{
+    uint32_t a = 0, b = 0, c = 0, d = 0;
+    __asm__ volatile("cpuid" : "+a"(a), "=b"(b), "=c"(c), "=d"(d));
+    if (b != 0x68747541 || d != 0x69746e65 || c != 0x444d4163) return false;
+    a = 1;
+    __asm__ volatile("cpuid" : "+a"(a), "=b"(b), "=c"(c), "=d"(d));
+    unsigned family = ((a >> 8) & 15) + ((a >> 20) & 255);
+    return family == 0x19;
+}
+
 static void readAll(void *)
 {
     int c = cpu_number();
@@ -365,7 +377,7 @@ static int write_sysctl SYSCTL_HANDLER_ARGS
             // Only the validated enabled P0 definition is exposed by this driver.
             ok = ok && v == 0 && r.ok[3] && (r.pdef0 >> 63);
         }
-        ok = ok && r.supported;
+        ok = ok && (r.supported || (what == W_BOOST && boostCapableCpu()));
         if (!ok) { if (gLock) IOLockUnlock(gLock); return ENOTSUP; }
     }
     WriteReq w = { what, (uint64_t)v };
