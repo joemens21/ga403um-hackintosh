@@ -148,13 +148,13 @@ enum Sensors {
         }
         return (t, w)
     }
-    // AmdCppc decodes P0 with the Zen 5 rule (12-bit FID x 5 MHz). On a Zen 4 CPU (family 0x19: the GA403UM's Ryzen 9 270)
-    // the register is FID [7:0] x 200 / DID [13:8]: "P0 11040 MHz" is really 4000 MHz. Every clock in the report scales by
-    // the same factor, so it is corrected here until AmdCppc decodes Zen 4 itself.
+    // AmdCppc before its Zen 4 fix decoded P0 with the Zen 5 rule (12-bit FID x 5 MHz). On a Zen 4 CPU (family 0x19: the
+    // GA403UM's Ryzen 9 270) the register is FID [7:0] x 200 / DID [13:8]: "P0 11040 MHz" is really 4000 MHz. Every clock in
+    // the report scales by the same factor. A P0 above 6 GHz can only be the old decode; a fixed AmdCppc is left alone.
     static func clockFactor(_ report: String) -> Double {
         var family: Int32 = 0, n = MemoryLayout<Int32>.size
         guard sysctlbyname("machdep.cpu.family", &family, &n, nil, 0) == 0, family == 0x19,
-              let p0s = report.split(separator: " ").dropFirst().first, let p0 = Int(p0s), p0 > 0, p0 % 5 == 0 else { return 1 }
+              let p0s = report.split(separator: " ").dropFirst().first, let p0 = Int(p0s), p0 > 6000, p0 % 5 == 0 else { return 1 }
         let fid12 = p0 / 5, fid = fid12 & 0xFF, did = (fid12 >> 8) & 0x3F
         guard did > 0, fid > 0 else { return 1 }
         return Double(fid * 200 / did) / Double(p0)
@@ -908,7 +908,18 @@ struct RogControls: View {
                         Stat(symbol: "cpu", value: m.cpuMHz.map { "\($0)" } ?? "idle", label: "CPU clock · MHz")
                     }
                 }
-                RogSection(title: "History · last 10 minutes") { HistoryCharts(samples: m.history) }
+                RogSection(title: "NVIDIA GPU") {
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack(spacing: 16) {
+                            Stat(symbol: "thermometer.medium", value: gv(m.gpu?.tempC) { "\($0)°" }, label: "GPU temperature")
+                            Stat(symbol: "chart.bar", value: gv(m.gpu?.gfxPct) { "\($0) %" }, label: "GPU load")
+                            Stat(symbol: "speedometer", value: gv(m.gpu?.coreMHz) { "\($0)" }, label: "Core clock · MHz")
+                            Stat(symbol: "memorychip", value: vramText, label: "Video memory · GB")
+                        }
+                        Text(gpuDetail).font(.callout).foregroundStyle(.secondary)
+                        Text(gpuLine).font(.callout).foregroundStyle(.secondary)
+                    }
+                }
             }
             if page == .overview || page == .performance {
                 RogSection(title: "Performance mode") { modes.disabled(!m.st.present) }
@@ -959,18 +970,7 @@ struct RogControls: View {
                 }
             }
             if page == .overview {
-                RogSection(title: "NVIDIA GPU") {
-                    VStack(alignment: .leading, spacing: 12) {
-                        HStack(spacing: 16) {
-                            Stat(symbol: "thermometer.medium", value: gv(m.gpu?.tempC) { "\($0)°" }, label: "GPU temperature")
-                            Stat(symbol: "chart.bar", value: gv(m.gpu?.gfxPct) { "\($0) %" }, label: "GPU load")
-                            Stat(symbol: "speedometer", value: gv(m.gpu?.coreMHz) { "\($0)" }, label: "Core clock · MHz")
-                            Stat(symbol: "memorychip", value: vramText, label: "Video memory · GB")
-                        }
-                        Text(gpuDetail).font(.callout).foregroundStyle(.secondary)
-                        Text(gpuLine).font(.callout).foregroundStyle(.secondary)
-                    }
-                }
+                RogSection(title: "History · last 10 minutes") { HistoryCharts(samples: m.history) }
             }
             if page == .settings {
                 RogSection(title: "Startup") {

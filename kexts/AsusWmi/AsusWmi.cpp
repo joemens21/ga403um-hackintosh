@@ -141,6 +141,8 @@ public:
     IOReturn kbdSet(int level);
     IOReturn slashApply(uint32_t packed);
     IOReturn auraApply(uint32_t packed);
+    IOReturn smuPpt(int i, int watts);
+    bool pptSmu = false;                                         // the last power limit went through AmdCppc's SMU path
     // hotkeys: Notify (ATKD, 0xFF), codes from _WED (0xFF), handled on a thread call
     IONotifier *atkNotifier = nullptr;
     thread_call_t evCall = nullptr;
@@ -378,6 +380,21 @@ IOReturn AsusWmi::slashApply(uint32_t v)
     return r;
 }
 
+// Power limits through AmdCppc (it owns the SMN index/data pair and the SMU mailbox): SPL -> STAPM, SPPT -> slow, FPPT -> fast
+IOReturn AsusWmi::smuPpt(int i, int watts)
+{
+    static const uintptr_t kKind[3] = { 0, 1, 2 };
+    OSDictionary *m = IOService::serviceMatching("AmdCppc");
+    if (!m) return kIOReturnNoMemory;
+    IOService *cppc = IOService::copyMatchingService(m);
+    m->release();
+    if (!cppc) return kIOReturnNotFound;
+    uint32_t rsp = 0;
+    IOReturn r = cppc->callPlatformFunction("AmdCppcSetPpt", false, (void *)kKind[i], (void *)(uintptr_t)(watts * 1000), &rsp, nullptr);
+    cppc->release();
+    return r;
+}
+
 // G-Helper Aura (report 0x5D, 128 bytes): init B9 / "ASUS Tech.Inc." / 05 20 31 00 1A, then B3 <zone 0> <mode> R G B <speed>
 // 00 00 R2 G2 B2, set B5, apply B4. One zone on the GA403; checked on a GA403UM with a test tool (colour and Breathe).
 static const uint8_t kAuraCode[ASUS_AURA_MODE_COUNT] = { 0x00, 0x01, 0x02, 0x03, 0x0A };   // static breathe cycle rainbow strobe
@@ -513,7 +530,13 @@ IOReturn AsusWmi::setValue(int what, int v)
         if (v < r.lo || v > r.hi) return kIOReturnBadArgument;
         if (!fanCustom) return kIOReturnNotPermitted;            // asus-armoury: PPT needs an active custom fan curve here
         ok = devs(kPptDev[i], (uint32_t)v, &ret);
-        if (ok) pptSet[i] = (uint32_t)v;
+        if (!ok) {                                               // GA403UM BIOS: no WMI power-limit devices; AmdCppc's SMU path
+            IOReturn s2 = smuPpt(i, v);
+            say("set %d=%d -> wmi failed, smu %08x", what, v, s2);
+            if (s2 == kIOReturnSuccess) { pptSet[i] = (uint32_t)v; pptSmu = true; }
+            return s2;
+        }
+        pptSet[i] = (uint32_t)v; pptSmu = false;
         break;
     }
     case ASUS_SET_CHARGE:
@@ -758,8 +781,8 @@ static void buildStatus()
                           gSelf->fanCustom, gSelf->curProfile, gSelf->curCharge);
     uint32_t bl = 0;
     if (gSelf->blGet(&bl)) n += (size_t)snprintf(gStatus + n, sizeof(gStatus) - n, " backlight=%u/%u", bl, gSelf->blMaxLevel);
-    n += (size_t)snprintf(gStatus + n, sizeof(gStatus) - n, " kbd=%d slash=%lld aura=%lld last_key=%02x", gSelf->kbdLevel,
-                          (long long)gSelf->slashSet, (long long)gSelf->auraSet, gSelf->lastKey);
+    n += (size_t)snprintf(gStatus + n, sizeof(gStatus) - n, " kbd=%d slash=%lld aura=%lld last_key=%02x ppt_path=%s", gSelf->kbdLevel,
+                          (long long)gSelf->slashSet, (long long)gSelf->auraSet, gSelf->lastKey, gSelf->pptSmu ? "smu" : "wmi");
     for (int i = 0; i < 3; i++) {
         static const char *const nm[3] = { "spl", "sppt", "fppt" };
         n += (size_t)snprintf(gStatus + n, sizeof(gStatus) - n, " ppt_%s=%u", nm[i], gSelf->pptSet[i]);
