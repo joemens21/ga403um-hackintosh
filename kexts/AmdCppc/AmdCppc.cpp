@@ -20,6 +20,12 @@
 //   sysctl debug.amdcppc.epp=<0..255>  CPPC request on every CPU: max = highest perf, min = lowest non-linear, desired = 0
 //                                      (autonomous), EPP = value (0 performance .. 128 balanced .. 255 power save). Only when
 //                                      CPPC is enabled.
+//   sysctl debug.amdcppc.ppt_stapm=<W>, ppt_slow=<W>, ppt_fast=<W>   (GA403UM patch) CPU power limits through the SMU's MP1
+//                                      mailbox (messages 0x14 / 0x16 / 0x15, as RyzenAdj for Phoenix / Hawk Point), 5..90 W;
+//                                      read: the last value set (0 = not set since boot). Phoenix / Hawk Point only. AsusWmi uses
+//                                      the same path through callPlatformFunction("AmdCppcSetPpt") when the BIOS has no WMI
+//                                      power-limit devices (GA403UM). The mailbox shares the SMN index/data pair with the Tctl read,
+//                                      so both run under gLock.
 // Reads are #GP-safe. Writes use wrmsr64 after preflight; a successful read does NOT guarantee a fault-safe write.
 // Writes are restricted to Strix Point with CPPC capability and validated fields.
 // AmdCppcPolicy provides autonomous EPP policy and sleep/wake restoration outside the kernel.
@@ -81,6 +87,41 @@ static bool supportedCpu()
     a = 0x80000008;
     __asm__ volatile("cpuid" : "+a"(a), "=b"(b), "=c"(c), "=d"(d));
     return (b & (1u << 27)) != 0; // AMD CPPC full-MSR support
+}
+
+// GA403UM patch: PStateDef decode by family. Zen 5 (0x1A): CpuFid[11:0] x 5 MHz. Zen 4 (0x19): CpuFid[7:0] x 200 / CpuDfsId[13:8]
+// (the Ryzen 9 270's P0 read as 11040 MHz with the Zen 5 rule; it is 4000 MHz).
+static unsigned cpuFamily()
+{
+    uint32_t a = 1, b = 0, c = 0, d = 0;
+    __asm__ volatile("cpuid" : "+a"(a), "=b"(b), "=c"(c), "=d"(d));
+    return ((a >> 8) & 15) + ((a >> 20) & 255);
+}
+static unsigned cpuModel()
+{
+    uint32_t a = 1, b = 0, c = 0, d = 0;
+    __asm__ volatile("cpuid" : "+a"(a), "=b"(b), "=c"(c), "=d"(d));
+    return ((a >> 4) & 15) | ((a >> 12) & 240);
+}
+static unsigned pdefMhz(uint64_t pdef)
+{
+    if (cpuFamily() == 0x19) {
+        unsigned fid = (unsigned)(pdef & 0xff), dfs = (unsigned)((pdef >> 8) & 0x3f);
+        return dfs ? fid * 200 / dfs : 0;
+    }
+    return (unsigned)(pdef & 0xfff) * 5;
+}
+
+// GA403UM patch: HWCR[CpbDis] (bit 25) is architectural on AMD family 17h+; allow only the boost switch on Zen 3/4 (family 0x19)
+static bool boostCapableCpu()
+{
+    uint32_t a = 0, b = 0, c = 0, d = 0;
+    __asm__ volatile("cpuid" : "+a"(a), "=b"(b), "=c"(c), "=d"(d));
+    if (b != 0x68747541 || d != 0x69746e65 || c != 0x444d4163) return false;
+    a = 1;
+    __asm__ volatile("cpuid" : "+a"(a), "=b"(b), "=c"(c), "=d"(d));
+    unsigned family = ((a >> 8) & 15) + ((a >> 20) & 255);
+    return family == 0x19;
 }
 
 static void readAll(void *)
@@ -145,7 +186,7 @@ static void buildReport()
                 done[k] = true; same++;
             }
         }
-        unsigned mhz0 = r.ok[3] ? (unsigned)(r.pdef0 & 0xfff) * 5 : 0;      // Zen 4/5 PStateDef: CpuFid[11:0] x 5 MHz
+        unsigned mhz0 = r.ok[3] ? pdefMhz(r.pdef0) : 0;
         n += (size_t)snprintf(gReport + n, sizeof(gReport) - n,
             "%scpu%d(x%d): CpbDis=%d PStateCtl=%llu PStateStat=%llu P0=%uMHz(def %s) CPPC_EN=%s CAP1=high %llu nom %llu lownl %llu low %llu "
             "REQ=max %llu min %llu des %llu epp %llu",
@@ -178,7 +219,7 @@ static void buildFreq()
     IOSleep(200);
     gFdst = gF1;
     mp_rendezvous_no_intrs(sampleAll, nullptr);
-    unsigned p0 = gRegs[0].ok[3] ? (unsigned)(gRegs[0].pdef0 & 0xfff) * 5 : 0;
+    unsigned p0 = gRegs[0].ok[3] ? pdefMhz(gRegs[0].pdef0) : 0;
     size_t n = (size_t)snprintf(gFreq, sizeof(gFreq), "P0 %u MHz; cpu: MHz while busy / busy %% / hwstat", p0);
     for (int c = 0; c < gNcpu && n + 48 < sizeof(gFreq); c++) {
         const FreqSample &x = gF0[c], &y = gF1[c];
@@ -239,7 +280,7 @@ static int report_sysctl SYSCTL_HANDLER_ARGS
 }
 // SMN register through the root complex (bus 0, device 0, function 0): index at 0x60, data at 0x64 (Linux amd_smn_read)
 static IOPCIDevice *gRoot;
-static bool smnRead(uint32_t addr, uint32_t *val)
+static bool findRoot()
 {
     if (!gRoot) {
         OSDictionary *m = IOService::serviceMatching("IOPCIDevice");
@@ -260,10 +301,75 @@ static bool smnRead(uint32_t addr, uint32_t *val)
             }
         }
     }
-    if (!gRoot) return false;
+    return gRoot != nullptr;
+}
+static bool smnRead(uint32_t addr, uint32_t *val)
+{
+    if (!findRoot()) return false;
     gRoot->configWrite32(0x60, addr);
     *val = gRoot->configRead32(0x64);
     return true;
+}
+static bool smnWrite(uint32_t addr, uint32_t val)
+{
+    if (!findRoot()) return false;
+    gRoot->configWrite32(0x60, addr);
+    gRoot->configWrite32(0x64, val);
+    return true;
+}
+
+// ---- GA403UM patch: CPU power limits through the SMU (MP1 mailbox) ---------------------------------------------------------
+// Phoenix (model 0x74) and Hawk Point (0x75), family 0x19: RyzenAdj's FAM_PHOENIX / FAM_HAWKPOINT addresses and messages.
+// Protocol: wait for a non-zero response (the SMU is idle), clear it, write the six arguments, write the message id, wait for
+// the response: 1 ok, 0xFE unknown message, 0xFF / 0xFD refused or busy. All under gLock (the SMN pair is shared).
+#define MP1_MSG 0x03B10528
+#define MP1_RSP 0x03B10578
+#define MP1_ARG 0x03B10998
+enum { PPT_STAPM = 0, PPT_SLOW = 1, PPT_FAST = 2 };
+static const uint32_t kPptMsg[3] = { 0x14, 0x16, 0x15 };       // set_stapm_limit, set_slow_limit, set_fast_limit (mW)
+static uint32_t gPptMw[3];                                      // last value set since boot
+static uint32_t gPptRsp = 0;                                    // last mailbox response
+static bool pptCapableCpu() { return cpuFamily() == 0x19 && (cpuModel() == 0x74 || cpuModel() == 0x75); }
+static bool smuWait(uint32_t *rsp)
+{
+    for (int i = 0; i < 1000; i++) {                            // up to ~1 s
+        if (!smnRead(MP1_RSP, rsp)) return false;
+        if (*rsp) return true;
+        IOSleep(1);
+    }
+    return false;
+}
+// gLock held
+static IOReturn pptSet(int kind, uint32_t mw)
+{
+    if (kind < 0 || kind > 2 || mw < 5000 || mw > 90000) return kIOReturnBadArgument;
+    if (!pptCapableCpu()) return kIOReturnUnsupported;
+    uint32_t rsp = 0;
+    if (!smuWait(&rsp)) { gPptRsp = 0xFFFFFFFF; return kIOReturnBusy; }
+    if (!smnWrite(MP1_RSP, 0)) return kIOReturnNotFound;
+    for (uint32_t i = 0; i < 6; i++) smnWrite(MP1_ARG + 4 * i, i ? 0 : mw);
+    smnWrite(MP1_MSG, kPptMsg[kind]);
+    if (!smuWait(&rsp)) { gPptRsp = 0xFFFFFFFE; return kIOReturnTimeout; }
+    gPptRsp = rsp;
+    if (rsp != 1) return kIOReturnIOError;
+    gPptMw[kind] = mw;
+    return kIOReturnSuccess;
+}
+static int ppt_sysctl SYSCTL_HANDLER_ARGS
+{
+    int kind = (int)arg2;
+    if (gLock) IOLockLock(gLock);
+    int w = (int)(gPptMw[kind] / 1000);
+    if (gLock) IOLockUnlock(gLock);
+    int e = sysctl_handle_int(oidp, &w, 0, req);
+    if (e || !req->newptr) return e;
+    if (w < 5 || w > 90) return EINVAL;
+    if (gLock) IOLockLock(gLock);
+    IOReturn r = pptSet(kind, (uint32_t)w * 1000);
+    uint32_t rsp = gPptRsp;
+    if (gLock) IOLockUnlock(gLock);
+    IOLog("AmdCppc: ppt %d = %d W -> %08x (smu %x)\n", kind, w, r, rsp);
+    return r == kIOReturnSuccess ? 0 : r == kIOReturnUnsupported ? ENOTSUP : r == kIOReturnBadArgument ? EINVAL : EIO;
 }
 static char gTemp[256];
 static void buildTemp()
@@ -365,7 +471,7 @@ static int write_sysctl SYSCTL_HANDLER_ARGS
             // Only the validated enabled P0 definition is exposed by this driver.
             ok = ok && v == 0 && r.ok[3] && (r.pdef0 >> 63);
         }
-        ok = ok && r.supported;
+        ok = ok && (r.supported || (what == W_BOOST && boostCapableCpu()));
         if (!ok) { if (gLock) IOLockUnlock(gLock); return ENOTSUP; }
     }
     WriteReq w = { what, (uint64_t)v };
@@ -397,6 +503,9 @@ SYSCTL_PROC(_debug_amdcppc, OID_AUTO, pstate, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG
 SYSCTL_PROC(_debug_amdcppc, OID_AUTO, boost, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, W_BOOST, write_sysctl, "I", "1 = boost allowed");
 SYSCTL_PROC(_debug_amdcppc, OID_AUTO, cppc, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, W_CPPC_EN, write_sysctl, "I", "1 = enable CPPC");
 SYSCTL_PROC(_debug_amdcppc, OID_AUTO, epp, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, W_EPP, write_sysctl, "I", "CPPC EPP");
+SYSCTL_PROC(_debug_amdcppc, OID_AUTO, ppt_stapm, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, PPT_STAPM, ppt_sysctl, "I", "STAPM limit W");
+SYSCTL_PROC(_debug_amdcppc, OID_AUTO, ppt_slow, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, PPT_SLOW, ppt_sysctl, "I", "slow PPT W");
+SYSCTL_PROC(_debug_amdcppc, OID_AUTO, ppt_fast, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, PPT_FAST, ppt_sysctl, "I", "fast PPT W");
 
 // Wake invalidates the energy/time baseline; defer hardware access to normal readers/policy.
 static IONotifier *gPowerNotifier;
@@ -418,8 +527,22 @@ class AmdCppc : public IOService {
 public:
     bool start(IOService *provider) override;
     void stop(IOService *provider) override;
+    // "AmdCppcSetPpt": p1 = kind (0 STAPM, 1 slow, 2 fast), p2 = milliwatts, p3 = uint32_t * SMU response (may be null)
+    IOReturn callPlatformFunction(const OSSymbol *name, bool wait, void *p1, void *p2, void *p3, void *p4) override;
 };
 OSDefineMetaClassAndStructors(AmdCppc, IOService)
+
+IOReturn AmdCppc::callPlatformFunction(const OSSymbol *name, bool wait, void *p1, void *p2, void *p3, void *p4)
+{
+    if (!name || !name->isEqualTo("AmdCppcSetPpt")) return IOService::callPlatformFunction(name, wait, p1, p2, p3, p4);
+    if (!gLock) return kIOReturnNotReady;
+    IOLockLock(gLock);
+    IOReturn r = pptSet((int)(uintptr_t)p1, (uint32_t)(uintptr_t)p2);
+    if (p3) *(uint32_t *)p3 = gPptRsp;
+    IOLockUnlock(gLock);
+    IOLog("AmdCppc: ppt %d = %u mW (AsusWmi) -> %08x (smu %x)\n", (int)(uintptr_t)p1, (unsigned)(uintptr_t)p2, r, gPptRsp);
+    return r;
+}
 
 bool AmdCppc::start(IOService *provider)
 {
@@ -439,6 +562,9 @@ bool AmdCppc::start(IOService *provider)
     sysctl_register_oid(&sysctl__debug_amdcppc_boost);
     sysctl_register_oid(&sysctl__debug_amdcppc_cppc);
     sysctl_register_oid(&sysctl__debug_amdcppc_epp);
+    sysctl_register_oid(&sysctl__debug_amdcppc_ppt_stapm);
+    sysctl_register_oid(&sysctl__debug_amdcppc_ppt_slow);
+    sysctl_register_oid(&sysctl__debug_amdcppc_ppt_fast);
     gPowerNotifier = registerSleepWakeInterest(powerNotify, this);
     if (!gPowerNotifier) { stop(provider); return false; }
     registerService();
@@ -448,6 +574,9 @@ bool AmdCppc::start(IOService *provider)
 void AmdCppc::stop(IOService *provider)
 {
     if (gPowerNotifier) { gPowerNotifier->remove(); gPowerNotifier = nullptr; }
+    sysctl_unregister_oid(&sysctl__debug_amdcppc_ppt_fast);
+    sysctl_unregister_oid(&sysctl__debug_amdcppc_ppt_slow);
+    sysctl_unregister_oid(&sysctl__debug_amdcppc_ppt_stapm);
     sysctl_unregister_oid(&sysctl__debug_amdcppc_epp);
     sysctl_unregister_oid(&sysctl__debug_amdcppc_cppc);
     sysctl_unregister_oid(&sysctl__debug_amdcppc_boost);
