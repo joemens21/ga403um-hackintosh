@@ -30,6 +30,12 @@ namespace UserConfigs::Card
     
     /// Specify the maximum number of attempts to retry an application command
     extern UInt32 ACMDMaxNumAttempts;
+
+    /// GA403UM: milliseconds to wait after each power-up step (upstream left the bus config's power delay at 0)
+    extern UInt32 PowerDelay;
+
+    /// GA403UM: maximum number of CMD8 attempts (each retry sends CMD0 first)
+    extern UInt32 CMD8MaxNumAttempts;
 }
 
 #endif /* IOSDHostDriverUserConfigs_hpp */

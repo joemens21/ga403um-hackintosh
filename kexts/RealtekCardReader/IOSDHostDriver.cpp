@@ -717,6 +717,9 @@ IOReturn IOSDHostDriver::powerUp(UInt32 ocr)
     
     config.vdd = myfls(ocr) - 1;
 
+    // GA403UM: the bus config's power delay was never set (0 ms); give the card time to power up (iosdpwrd)
+    config.powerDelay = UserConfigs::Card::PowerDelay;
+
     config.powerMode = IOSDBusConfig::PowerMode::kPowerUp;
 
     IOReturn retVal = this->setInitialBusConfig();
@@ -1691,7 +1694,27 @@ bool IOSDHostDriver::probeCardAtFrequency(UInt32 frequency, UInt32& rocr)
 
         // Check whether a SD card is inserted
         // Note that MMC cards are not supported
-        if (this->CMD8(ocr) != kIOReturnSuccess)
+        // GA403UM: retry CMD8 (after CMD0) before treating the card as an SD 1.x one
+        bool sd2 = false;
+
+        for (UInt32 attempt = 0; attempt < UserConfigs::Card::CMD8MaxNumAttempts && !sd2; attempt += 1)
+        {
+            if (attempt > 0)
+            {
+                pinfo("Retrying the CMD8 (attempt %u)...", attempt + 1);
+
+                IOSleep(UserConfigs::Card::PowerDelay);
+
+                if (this->CMD0() != kIOReturnSuccess)
+                {
+                    break;
+                }
+            }
+
+            sd2 = this->CMD8(ocr) == kIOReturnSuccess;
+        }
+
+        if (!sd2)
         {
             perr("The card does not respond to the CMD8.");
         }

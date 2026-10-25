@@ -40,7 +40,7 @@ and Bluetooth until they are ported ([docs/TAHOE-MIGRATION.md](docs/TAHOE-MIGRAT
 - [x] **Webcam:** 640 × 480 through the OBS virtual camera
 - [ ] **HDMI hot-plug:** connect HDMI before power-on (NullMoth issue)
 - [ ] **Sleep / wake, AirDrop, WPA3:** not working; sleep is turned off
-- [ ] **SD reader (Realtek RTS525A):** driver detects the card but does not start it yet (under test)
+- [x] **SD reader (Realtek RTS525A):** our build of FireWolf's RealtekCardReader with a power-up delay and CMD8 retries; a 256 GB SDXC card mounts
 
 ## Install and build
 

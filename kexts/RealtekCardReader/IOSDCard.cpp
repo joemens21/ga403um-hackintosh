@@ -820,11 +820,35 @@ IOReturn IOSDCard::initializeCard(UInt32 ocr, SpeedMode& speedMode)
     pinfo("The card is now in the idle state.");
     
     // Check whether the card supports SD 2.0
-    if (this->driver->CMD8(ocr) == kIOReturnSuccess)
+    // GA403UM: retry CMD8 (after CMD0): a missed CMD8 drops HCS from ACMD41 and a SDHC/SDXC card then stays busy for good
+    bool sd2 = false;
+
+    for (UInt32 attempt = 0; attempt < UserConfigs::Card::CMD8MaxNumAttempts && !sd2; attempt += 1)
+    {
+        if (attempt > 0)
+        {
+            pinfo("Retrying the CMD8 (attempt %u)...", attempt + 1);
+
+            IOSleep(UserConfigs::Card::PowerDelay);
+
+            if (this->driver->CMD0() != kIOReturnSuccess)
+            {
+                break;
+            }
+        }
+
+        sd2 = this->driver->CMD8(ocr) == kIOReturnSuccess;
+    }
+
+    if (sd2)
     {
         pinfo("Found a SD 2.0 compliant card.");
         
         ocr |= OCR::kCardCapacityStatus;
+    }
+    else
+    {
+        perr("The card does not respond to the CMD8; initializing it as a SD 1.x card.");
     }
     
     // Check whether the host supports the UHS-I mode

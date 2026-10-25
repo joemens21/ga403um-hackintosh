@@ -74,6 +74,13 @@ want AmdCppc "${TARGETS[@]+"${TARGETS[@]}"}" && build_kext AmdCppc kexts/AmdCppc
 want MtkBtFw "${TARGETS[@]+"${TARGETS[@]}"}" && build_kext MtkBtFw kexts/MtkBtFw kmod_info.c MtkBtFw.cpp fw_blob.c
 want AsusWmi "${TARGETS[@]+"${TARGETS[@]}"}" && build_kext AsusWmi kexts/AsusWmi kmod_info.c AsusWmi.cpp
 want StrixAmp "${TARGETS[@]+"${TARGETS[@]}"}" && build_kext StrixAmp kexts/StrixAmp kmod_info.c StrixAmp.cpp
+# RealtekCardReader (FireWolf, BSD-3, upstream 0.9.7 006a845) with GA403UM changes; RTSX_DEBUG=1 builds the verbose log version
+if want RealtekCardReader "${TARGETS[@]+"${TARGETS[@]}"}"; then
+  RTSX_SRC=$(cd kexts/RealtekCardReader && ls *.cpp)
+  CXXFLAGS_SAVE="$CXXFLAGS"; [ "${RTSX_DEBUG:-0}" = 1 ] && CXXFLAGS="$CXXFLAGS -DDEBUG=1"
+  build_kext RealtekCardReader kexts/RealtekCardReader kmod_info.c $RTSX_SRC
+  CXXFLAGS="$CXXFLAGS_SAVE"
+fi
 # BtLeDlFix is a Lilu plugin: Lilu headers + plugin_start.cpp come from acidanthera/Lilu (cloned into build/Lilu).
 if want BtLeDlFix "${TARGETS[@]+"${TARGETS[@]}"}"; then
   LILU_DIR="${LILU:-build/Lilu}"
