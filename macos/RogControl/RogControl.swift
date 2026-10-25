@@ -19,6 +19,8 @@ import SwiftUI
 import Charts
 import IOKit
 import IOKit.ps
+import CoreAudio
+import AudioToolbox
 
 // ---- driver access (asuswmi_abi.h) -----------------------------------------------------------------------------------------
 struct AsusState {
@@ -570,6 +572,13 @@ final class RogModel: ObservableObject {
         onChange?()
     }
 
+    // Fn+F5 (G14Hotkeys, rogcontrol://cycle-mode): Silent -> Performance -> Turbo -> Silent; Turbo is skipped on battery
+    func cycleMode() {
+        var order: [Mode] = [.silent, .performance, .turbo]
+        if !st.ac { order.removeLast() }
+        let cur = activeMode.flatMap { order.firstIndex(of: $0) } ?? -1
+        choose(order[(cur + 1) % order.count])
+    }
     func choose(_ m: Mode) {
         settings.mode = m
         settings.save(ac: st.ac)
@@ -1521,12 +1530,134 @@ struct RogWindowView: View {
     }
 }
 
+// ---- audio: speaker mute (Fn+F1 / F1 through G14Hotkeys), mic mute state ---------------------------------------------------
+// The built-in output (AppleALC) has no mute control: muting sets the volume to 0 and back to the saved level.
+enum AudioDev {
+    static func defaultDevice(input: Bool) -> AudioObjectID {
+        var a = AudioObjectPropertyAddress(mSelector: input ? kAudioHardwarePropertyDefaultInputDevice : kAudioHardwarePropertyDefaultOutputDevice,
+                                           mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        var dev = AudioObjectID(kAudioObjectUnknown), n = UInt32(MemoryLayout<AudioObjectID>.size)
+        AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &a, 0, nil, &n, &dev)
+        return dev
+    }
+    static func address(_ sel: AudioObjectPropertySelector, input: Bool) -> AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(mSelector: sel, mScope: input ? kAudioDevicePropertyScopeInput : kAudioDevicePropertyScopeOutput,
+                                   mElement: kAudioObjectPropertyElementMain)
+    }
+    static func settable(_ dev: AudioObjectID, _ a: inout AudioObjectPropertyAddress) -> Bool {
+        var ok: DarwinBoolean = false
+        return AudioObjectHasProperty(dev, &a) && AudioObjectIsPropertySettable(dev, &a, &ok) == noErr && ok.boolValue
+    }
+    // muted: the mute control if there is one, else volume 0
+    static func isMuted(input: Bool) -> Bool? {
+        let dev = defaultDevice(input: input)
+        guard dev != kAudioObjectUnknown else { return nil }
+        var m = address(kAudioDevicePropertyMute, input: input)
+        if AudioObjectHasProperty(dev, &m) {
+            var v: UInt32 = 0, n = UInt32(MemoryLayout<UInt32>.size)
+            if AudioObjectGetPropertyData(dev, &m, 0, nil, &n, &v) == noErr { return v != 0 }
+        }
+        var a = address(kAudioHardwareServiceDeviceProperty_VirtualMainVolume, input: input)
+        var vol: Float32 = 1, n = UInt32(MemoryLayout<Float32>.size)
+        guard AudioObjectGetPropertyData(dev, &a, 0, nil, &n, &vol) == noErr else { return nil }
+        return vol < 0.001
+    }
+    // returns the new state (true = muted), nil when the device has neither mute nor volume control
+    static func toggleSpeaker() -> Bool? {
+        let dev = defaultDevice(input: false)
+        guard dev != kAudioObjectUnknown else { return nil }
+        var m = address(kAudioDevicePropertyMute, input: false)
+        if settable(dev, &m) {
+            var v: UInt32 = 0, n = UInt32(MemoryLayout<UInt32>.size)
+            AudioObjectGetPropertyData(dev, &m, 0, nil, &n, &v)
+            v = v == 0 ? 1 : 0
+            return AudioObjectSetPropertyData(dev, &m, 0, nil, n, &v) == noErr ? v != 0 : nil
+        }
+        var a = address(kAudioHardwareServiceDeviceProperty_VirtualMainVolume, input: false)
+        guard settable(dev, &a) else { return nil }
+        var vol: Float32 = 0, n = UInt32(MemoryLayout<Float32>.size)
+        AudioObjectGetPropertyData(dev, &a, 0, nil, &n, &vol)
+        let d = UserDefaults.standard
+        if vol > 0.001 { d.set(vol, forKey: "speakerSavedVolume"); vol = 0 }
+        else { vol = d.object(forKey: "speakerSavedVolume") as? Float32 ?? 0.5 }
+        return AudioObjectSetPropertyData(dev, &a, 0, nil, n, &vol) == noErr ? vol < 0.001 : nil
+    }
+    // calls back on the main queue when the default device or its mute / volume changes
+    static func watch(input: Bool, _ changed: @escaping () -> Void) {
+        let q = DispatchQueue.main
+        var sys = AudioObjectPropertyAddress(mSelector: input ? kAudioHardwarePropertyDefaultInputDevice : kAudioHardwarePropertyDefaultOutputDevice,
+                                             mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        var watched = AudioObjectID(kAudioObjectUnknown)
+        func attach() {
+            let dev = defaultDevice(input: input)
+            guard dev != watched, dev != kAudioObjectUnknown else { return }
+            watched = dev
+            for sel in [kAudioDevicePropertyMute, kAudioHardwareServiceDeviceProperty_VirtualMainVolume] {
+                var a = address(sel, input: input)
+                if AudioObjectHasProperty(dev, &a) { AudioObjectAddPropertyListenerBlock(dev, &a, q) { _, _ in changed() } }
+            }
+        }
+        attach()
+        AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &sys, q) { _, _ in attach(); changed() }
+    }
+}
+
+// A small on-screen notice like macOS's own volume pop-up (icon + text, fades after 1.5 s)
+@MainActor
+final class HUD {
+    private var panel: NSPanel?
+    private var hide: DispatchWorkItem?
+    func show(_ symbol: String, _ text: String) {
+        let p = panel ?? make()
+        panel = p
+        if let stack = p.contentView?.subviews.first?.subviews.first as? NSStackView {
+            (stack.arrangedSubviews[0] as? NSImageView)?.image = NSImage(systemSymbolName: symbol, accessibilityDescription: text)?
+                .withSymbolConfiguration(.init(pointSize: 44, weight: .regular))
+            (stack.arrangedSubviews[1] as? NSTextField)?.stringValue = text
+        }
+        if let screen = NSScreen.main {
+            let f = screen.visibleFrame
+            p.setFrameOrigin(NSPoint(x: f.midX - p.frame.width / 2, y: f.minY + f.height * 0.18))
+        }
+        p.alphaValue = 1
+        p.orderFrontRegardless()
+        hide?.cancel()
+        let w = DispatchWorkItem { [weak p] in
+            NSAnimationContext.runAnimationGroup({ $0.duration = 0.3; p?.animator().alphaValue = 0 }, completionHandler: { p?.orderOut(nil) })
+        }
+        hide = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: w)
+    }
+    private func make() -> NSPanel {
+        let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 200, height: 160), styleMask: [.borderless, .nonactivatingPanel],
+                        backing: .buffered, defer: false)
+        p.isOpaque = false; p.backgroundColor = .clear; p.hasShadow = true; p.ignoresMouseEvents = true
+        p.level = .statusBar
+        p.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
+        let fx = NSVisualEffectView(frame: p.contentView!.bounds)
+        fx.material = .hudWindow; fx.state = .active; fx.blendingMode = .behindWindow
+        fx.wantsLayer = true; fx.layer?.cornerRadius = 18; fx.layer?.masksToBounds = true
+        fx.autoresizingMask = [.width, .height]
+        let icon = NSImageView(); icon.contentTintColor = .labelColor
+        let label = NSTextField(labelWithString: ""); label.font = .systemFont(ofSize: 14, weight: .medium); label.alignment = .center
+        let stack = NSStackView(views: [icon, label]); stack.orientation = .vertical; stack.spacing = 10
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        fx.addSubview(stack)
+        NSLayoutConstraint.activate([stack.centerXAnchor.constraint(equalTo: fx.centerXAnchor), stack.centerYAnchor.constraint(equalTo: fx.centerYAnchor)])
+        p.contentView?.addSubview(fx)
+        return p
+    }
+}
+
 // ---- status item -------------------------------------------------------------------------------------------------------------
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSWindowDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     let popover = NSPopover()
     var model: RogModel!
+    let hud = HUD()
+    var micItem: NSStatusItem?                // red crossed-out mic while the microphone is muted
+    var micMuted: Bool?
     var window: NSWindow?
 
     func applicationDidFinishLaunching(_ n: Notification) {
@@ -1540,6 +1671,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         model.onChange = { [weak self] in self?.updateIcon() }
         updateIcon()
         setupMenus()
+        micMuted = AudioDev.isMuted(input: true)
+        updateMicItem()
+        AudioDev.watch(input: true) { [weak self] in MainActor.assumeIsolated { self?.micChanged() } }
         if !CommandLine.arguments.contains("--background") { showWindow() }
     }
 
@@ -1551,6 +1685,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         model.visible = true
         popover.show(relativeTo: b.bounds, of: b, preferredEdge: .minY)
         popover.contentViewController?.view.window?.makeKey()
+    }
+    // rogcontrol://cycle-mode (Fn+F5 through G14Hotkeys): next mode, shown in the popover for two seconds
+    func application(_ application: NSApplication, open urls: [URL]) {
+        for url in urls where url.scheme == "rogcontrol" && url.host == "speaker-mute" {     // F1 / Fn+F1 through G14Hotkeys
+            if let muted = AudioDev.toggleSpeaker() {
+                hud.show(muted ? "speaker.slash.fill" : "speaker.wave.2.fill", muted ? "Muted" : "Sound on")
+            } else {
+                hud.show("exclamationmark.triangle", "No volume control")
+            }
+        }
+        for url in urls where url.scheme == "rogcontrol" && url.host == "toggle" {     // ROG key
+            if let w = window, w.isVisible { w.close() } else { showWindow() }
+        }
+        for url in urls where url.scheme == "rogcontrol" && url.host == "cycle-mode" {
+            model.refresh()
+            model.cycleMode()
+            if !popover.isShown {
+                toggle()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                    MainActor.assumeIsolated { if self?.popover.isShown == true { self?.popover.performClose(nil) } }
+                }
+            }
+        }
+    }
+    // mic mute: a notice when it changes (mic key, an app or System Settings) and a menu bar mark while muted
+    func micChanged() {
+        let now = AudioDev.isMuted(input: true)
+        guard now != micMuted else { return }
+        micMuted = now
+        if let m = now { hud.show(m ? "mic.slash.fill" : "mic.fill", m ? "Microphone muted" : "Microphone on") }
+        updateMicItem()
+    }
+    func updateMicItem() {
+        if micMuted == true {
+            if micItem == nil {
+                let it = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+                let img = NSImage(systemSymbolName: "mic.slash.fill", accessibilityDescription: "Microphone muted")
+                img?.isTemplate = false
+                it.button?.image = img?.withSymbolConfiguration(.init(paletteColors: [.systemRed]))
+                it.button?.toolTip = "Microphone muted"
+                micItem = it
+            }
+        } else if let it = micItem {
+            NSStatusBar.system.removeStatusItem(it)
+            micItem = nil
+        }
     }
     func popoverDidClose(_ n: Notification) { updateVisibility() }
     func updateVisibility() { model.visible = popover.isShown || window?.isVisible == true }

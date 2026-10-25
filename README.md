@@ -35,7 +35,7 @@ and Bluetooth until they are ported ([docs/TAHOE-MIGRATION.md](docs/TAHOE-MIGRAT
 - [x] **Bluetooth:** classic and BLE
 - [x] **Speakers:** both CS35L56 amps and the woofer, amp level adjustable in RogControl
 - [x] **OLED brightness:** macOS slider and Fn+F7 / F8 together
-- [x] **Fn keys / ROG key:** keyboard light, Slash, mute, mic, brightness; ROG key opens RogControl
+- [x] **Fn keys / ROG key:** mute, keyboard light, Slash, performance mode, brightness, display off, mic, Fn-lock (Fn+Esc); ROG key opens / closes RogControl; mute pop-ups
 - [x] **ROG controls:** profiles, CPU power limits and temperature target, fan curves, charge limit, keyboard colour and effects, CPU boost switch (off by default), GPU status, history graphs
 - [x] **Webcam:** 640 × 480 through the OBS virtual camera
 - [ ] **HDMI hot-plug:** connect HDMI before power-on (NullMoth issue)

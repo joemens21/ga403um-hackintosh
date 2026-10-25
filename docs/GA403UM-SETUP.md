@@ -15,7 +15,7 @@ NullMoth NVIDIA driver 2.5.3 (RM 615.78.08).
 | Bluetooth | classic and BLE | `MtkBtFw`, `BtLeDlFix`, `BlueToolFixup` |
 | Speakers (2 x CS35L56 + woofer) | full range, bass at boot | `StrixAmp`, `strixampctl` daemon at -6 dB, AppleALC layout 33 (`docs/AUDIO-ROG.md`) |
 | OLED brightness | macOS slider and Fn+F7 / F8 in step | `NVRMAuxBacklight` (Lilu plugin), G14Hotkeys |
-| Fn keys | keyboard light, Slash, mic / speaker mute, brightness; the ROG key opens RogControl | G14Hotkeys (N-KEY HID), AsusWmi |
+| Fn keys | F1 mute, F2 / F3 keyboard light, F4 Slash, F5 next performance mode, F7 / F8 brightness, F11 display off (sleep is off), mic key; Fn+Esc toggles Fn-lock (F-keys alone do the functions, with a Tink / Pop sound); ROG key opens and closes RogControl; mute and mic changes show an on-screen notice, a muted mic a red mark in the menu bar | G14Hotkeys (N-KEY HID + keyboard tap), RogControl (`rogcontrol://` links), AsusWmi |
 | ROG controls | profiles, CPU power limits and temperature target (SMU), fan curves (editable), charge limit, keyboard colour / effects, Slash, CPU boost switch, GPU status, history; NVIDIA Dynamic Boost / temperature target (accepted by the BIOS, effect not measured) | RogControl, AsusWmi ABI 5, AmdCppc |
 | CPU | boost off by default (max 4.0 GHz), switchable; clocks, Tctl, package power | AmdCppc (`feat/amdcppc-zen4-boost`), boost switch daemon |
 | Webcam | 640 x 480 MJPEG 30 fps only (15 fps and often 720p / 1080p set the UVC frame error bit; macOS defaults to 1080p 15 fps, so apps show black): OBS Video Capture Device at 640 x 480 / 30 + virtual camera | OBS (started from Terminal, section 7) |
@@ -115,6 +115,9 @@ With `amfi_get_out_of_my_way` macOS never shows the privacy prompt for non-Apple
 
 ## 8. Day-to-day
 
+- Fn keys not handled: Fn+F6 (screenshot) and Fn+F9 (project) reach macOS as Cmd+Shift+S / Cmd+P (assign Fn+F6 to a
+  screenshot shortcut in System Settings -> Keyboard -> Keyboard Shortcuts -> Screenshots), Fn+F10 (touchpad toggle, code 0x6B)
+  is ignored, Fn+F12 (airplane) is the firmware's. Codes: Linux `drivers/hid/hid-asus.c`.
 - Brightness: slider and Fn+F7 / F8; the panel falls back to its own mode at boot and after display sleep, and G14Hotkeys puts
   the last level back.
 - Power: RogControl -> Performance -> Manual; SPL / SPPT / FPPT go to the SMU through AmdCppc (8 W floor; the BIOS has no
