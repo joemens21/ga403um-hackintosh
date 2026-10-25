@@ -20,7 +20,7 @@ NullMoth NVIDIA driver 2.5.3 (RM 615.78.08).
 | CPU | boost off by default (max 4.0 GHz), switchable; clocks, Tctl, package power | AmdCppc (`feat/amdcppc-zen4-boost`), boost switch daemon |
 | Webcam | 640 x 480 MJPEG 30 fps only (15 fps and often 720p / 1080p set the UVC frame error bit; macOS defaults to 1080p 15 fps, so apps show black): OBS Video Capture Device at 640 x 480 / 30 + virtual camera | OBS (started from Terminal, section 7) |
 | Battery | charge limit (80 % raw = 85 % in the UI), watts, time left, cycles | AsusWmi, SMCBatteryManager |
-| SD reader (Realtek RTS525A) | SDHC / SDXC cards mount (tested: 256 GB SDXC, exFAT) | `RealtekCardReader` 0.9.8: FireWolf's 0.9.7 built from source with a power-up delay (upstream left it at 0 ms, so the card missed CMD8 and stayed busy) and CMD8 retries; boot-args `iosdpwrd=<ms>` (default 20), `iosdc8na=<n>` (default 3) |
+| SD reader (Realtek RTS525A) | SDHC / SDXC cards mount at boot and when inserted later (tested: 256 GB SDXC, exFAT; eject and re-insert works) | `RealtekCardReader` 0.9.8: FireWolf's 0.9.7 built from source with a power-up delay (upstream left it at 0 ms, so the card missed CMD8 and stayed busy) and CMD8 retries; boot-args `iosdpwrd=<ms>` (default 20), `iosdc8na=<n>` (default 3) |
 
 Not working or parked: HDMI hot-plug (connect HDMI before power-on), sleep / wake (sleep is turned off), AirDrop, WPA3-SAE,
 802.1X re-authentication on long sessions, Bluetooth LE scanning after an MT7925 Bluetooth firmware crash (phone passkeys
