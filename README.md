@@ -15,6 +15,7 @@ The repo ships empty `itl_ssid*/itl_psk*` fields and `CHANGE_ME_*` SMBIOS placeh
 
 macOS Sequoia on the **ASUS ROG Zephyrus G14 (2025)** — Ryzen AI 9 HX 370 + RTX 5060 Laptop.
 OpenCore EFI, custom drivers and utilities for this machine.
+GA403UM (Ryzen 9 270 "Hawk Point"): branch `ga403um`, setup and differences in [docs/GA403UM-SETUP.md](docs/GA403UM-SETUP.md).
 
 [Tiếng Việt](README.vi.md) · [Installation](docs/INSTALL.md) · [Releases](https://github.com/thanhnndev/ga403wm-hackintosh/releases) · [Roadmap](docs/ROADMAP.md)
 
