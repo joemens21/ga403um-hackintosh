@@ -90,4 +90,21 @@ if want BtLeDlFix "${TARGETS[@]+"${TARGETS[@]}"}"; then
   echo "--- undefined symbols (BtLeDlFix)"
   nm -um build/BtLeDlFix.kext/Contents/MacOS/BtLeDlFix | head -40 || true
 fi
+# NVRMAuxBacklight: Lilu plugin, brightness slider for AUX-only eDP panels on NullMoth 2.5.3 (routes NVRM's nvkms_xnu_backlight)
+if want NVRMAuxBacklight "${TARGETS[@]+"${TARGETS[@]}"}"; then
+  LILU_DIR="${LILU:-build/Lilu}"
+  [ -d "$LILU_DIR" ] || git clone --depth 1 https://github.com/acidanthera/Lilu "$LILU_DIR"
+  mkdir -p build/NVRMAuxBacklight.kext/Contents/MacOS
+  cp kexts/NVRMAuxBacklight/Info.plist build/NVRMAuxBacklight.kext/Contents/Info.plist
+  LILU_DEFS="-DPRODUCT_NAME=NVRMAuxBacklight -DMODULE_VERSION=0.2.0 -DLILU_KEXT"
+  clang++ $COMMON $CXXFLAGS $LILU_DEFS -I"$LILU_DIR/Lilu" -c kexts/NVRMAuxBacklight/NVRMAuxBacklight.cpp -o "$OBJ/NVRMAuxBacklight_main.o"
+  clang++ $COMMON $CXXFLAGS $LILU_DEFS -I"$LILU_DIR/Lilu" -c "$LILU_DIR/Lilu/Library/plugin_start.cpp" -o "$OBJ/NVRMAuxBacklight_start.o"
+  clang   $COMMON -c kexts/NVRMAuxBacklight/kmod_info.c -o "$OBJ/NVRMAuxBacklight_kmod.o"
+  clang++ -arch x86_64 -mmacosx-version-min="$LINK_MIN" -nostdlib -Xlinker -kext -Xlinker -no_data_const \
+    -L"$SDK_DIR/Library/x86_64" -lkmodc++ -lkmod -lcc_kext "$OBJ/NVRMAuxBacklight_main.o" "$OBJ/NVRMAuxBacklight_start.o" \
+    "$OBJ/NVRMAuxBacklight_kmod.o" -o build/NVRMAuxBacklight.kext/Contents/MacOS/NVRMAuxBacklight
+  echo "built build/NVRMAuxBacklight.kext"
+  echo "--- undefined symbols (NVRMAuxBacklight)"
+  nm -um build/NVRMAuxBacklight.kext/Contents/MacOS/NVRMAuxBacklight | head -40 || true
+fi
 exit 0
