@@ -30,7 +30,7 @@ highest performance, so the limit sits in the platform. The profile and the PPT 
 | Profile per power source | asusd | RogControl keeps one setting set for AC and one for battery and re-applies on IOPowerSources changes and at login | ✅ works (owner-confirmed 2026-10-12) |
 | NVIDIA dynamic boost / temp target / TGP | dev `0x001200C0` / `0x001200C2` / `0x00120099` | base TGP shown (55 W); no writes: they notify the NVIDIA ACPI device and the NullMoth driver decides the GPU clocks | read only |
 | GPU MUX, dGPU disable | dev `0x00090016` / `0x00090020` | shown; **do not write** from macOS: the NVIDIA driver is running | read only |
-| Keyboard LEDs (Aura) | USB HID, N-KEY device `0b05:19b6`; GA403 boards: one zone, Static/Breathe/Pulse/Rainbow | user space HID feature reports, no kext needed | todo |
+| Keyboard LEDs (Aura) | USB HID, N-KEY device `0b05:19b6`; GA403 boards: one zone, Static/Breathe/Colour cycle/Rainbow/Strobe | AsusWmi `ASUS_SET_AURA` (ABI 4, report 0x5D: init `B9` / "ASUS Tech.Inc." / `05 20 31 00 1A`, `B3` mode RGB speed, `B5`, `B4`), RogControl Lighting page | done (GA403UM, 2026-10-23) |
 | Panel overdrive | dev `0x00050019` | WMI | todo (absent in this BIOS's DSTS list) |
 | GUI (rog-control-center) | Slint app over D-Bus | `macos/RogControl` menu bar app, user client (no sudo; admin or console user) | ✅ works (owner-confirmed 2026-10-12) |
 
