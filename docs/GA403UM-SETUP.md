@@ -16,7 +16,7 @@ NullMoth NVIDIA driver 2.5.3 (RM 615.78.08).
 | Speakers (2 x CS35L56 + woofer) | full range, bass at boot | `StrixAmp`, `strixampctl` daemon at -6 dB, AppleALC layout 33 (`docs/AUDIO-ROG.md`) |
 | OLED brightness | macOS slider and Fn+F7 / F8 in step | `NVRMAuxBacklight` (Lilu plugin), G14Hotkeys |
 | Fn keys | keyboard light, Slash, mic / speaker mute, brightness; the ROG key opens RogControl | G14Hotkeys (N-KEY HID), AsusWmi |
-| ROG controls | profiles, CPU power limits (SMU), fan curves (editable), charge limit, keyboard colour / effects, Slash, CPU boost switch, GPU status, history | RogControl, AsusWmi ABI 4, AmdCppc |
+| ROG controls | profiles, CPU power limits and temperature target (SMU), fan curves (editable), charge limit, keyboard colour / effects, Slash, CPU boost switch, GPU status, history; NVIDIA Dynamic Boost / temperature target (accepted by the BIOS, effect not measured) | RogControl, AsusWmi ABI 5, AmdCppc |
 | CPU | boost off by default (max 4.0 GHz), switchable; clocks, Tctl, package power | AmdCppc (`feat/amdcppc-zen4-boost`), boost switch daemon |
 | Webcam | 640 x 480 MJPEG 30 fps only (15 fps and often 720p / 1080p set the UVC frame error bit; macOS defaults to 1080p 15 fps, so apps show black): OBS Video Capture Device at 640 x 480 / 30 + virtual camera | OBS (started from Terminal, section 7) |
 | Battery | charge limit (80 % raw = 85 % in the UI), watts, time left, cycles | AsusWmi, SMCBatteryManager |

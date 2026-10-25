@@ -20,6 +20,7 @@
 //   sysctl debug.amdcppc.epp=<0..255>  CPPC request on every CPU: max = highest perf, min = lowest non-linear, desired = 0
 //                                      (autonomous), EPP = value (0 performance .. 128 balanced .. 255 power save). Only when
 //                                      CPPC is enabled.
+//   sysctl debug.amdcppc.tctl_limit=<°C>  (GA403UM patch) CPU temperature target (SMU message 0x19, RyzenAdj tctl-temp), 60..100
 //   sysctl debug.amdcppc.ppt_stapm=<W>, ppt_slow=<W>, ppt_fast=<W>   (GA403UM patch) CPU power limits through the SMU's MP1
 //                                      mailbox (messages 0x14 / 0x16 / 0x15, as RyzenAdj for Phoenix / Hawk Point), 5..90 W;
 //                                      read: the last value set (0 = not set since boot). Phoenix / Hawk Point only. AsusWmi uses
@@ -325,9 +326,10 @@ static bool smnWrite(uint32_t addr, uint32_t val)
 #define MP1_MSG 0x03B10528
 #define MP1_RSP 0x03B10578
 #define MP1_ARG 0x03B10998
-enum { PPT_STAPM = 0, PPT_SLOW = 1, PPT_FAST = 2 };
-static const uint32_t kPptMsg[3] = { 0x14, 0x16, 0x15 };       // set_stapm_limit, set_slow_limit, set_fast_limit (mW)
-static uint32_t gPptMw[3];                                      // last value set since boot
+enum { PPT_STAPM = 0, PPT_SLOW = 1, PPT_FAST = 2, PPT_TCTL = 3 };
+// set_stapm_limit, set_slow_limit, set_fast_limit (mW); set_tctl_temp (°C)
+static const uint32_t kPptMsg[4] = { 0x14, 0x16, 0x15, 0x19 };
+static uint32_t gPptMw[4];                                      // last value set since boot (mW, or °C for PPT_TCTL)
 static uint32_t gPptRsp = 0;                                    // last mailbox response
 static bool pptCapableCpu() { return cpuFamily() == 0x19 && (cpuModel() == 0x74 || cpuModel() == 0x75); }
 static bool smuWait(uint32_t *rsp)
@@ -342,7 +344,8 @@ static bool smuWait(uint32_t *rsp)
 // gLock held
 static IOReturn pptSet(int kind, uint32_t mw)
 {
-    if (kind < 0 || kind > 2 || mw < 5000 || mw > 90000) return kIOReturnBadArgument;
+    if (kind < 0 || kind > 3) return kIOReturnBadArgument;
+    if (kind == PPT_TCTL ? (mw < 60 || mw > 100) : (mw < 5000 || mw > 90000)) return kIOReturnBadArgument;
     if (!pptCapableCpu()) return kIOReturnUnsupported;
     uint32_t rsp = 0;
     if (!smuWait(&rsp)) { gPptRsp = 0xFFFFFFFF; return kIOReturnBusy; }
@@ -359,13 +362,14 @@ static int ppt_sysctl SYSCTL_HANDLER_ARGS
 {
     int kind = (int)arg2;
     if (gLock) IOLockLock(gLock);
-    int w = (int)(gPptMw[kind] / 1000);
+    const bool temp = kind == PPT_TCTL;
+    int w = (int)(temp ? gPptMw[kind] : gPptMw[kind] / 1000);
     if (gLock) IOLockUnlock(gLock);
     int e = sysctl_handle_int(oidp, &w, 0, req);
     if (e || !req->newptr) return e;
-    if (w < 5 || w > 90) return EINVAL;
+    if (temp ? (w < 60 || w > 100) : (w < 5 || w > 90)) return EINVAL;
     if (gLock) IOLockLock(gLock);
-    IOReturn r = pptSet(kind, (uint32_t)w * 1000);
+    IOReturn r = pptSet(kind, temp ? (uint32_t)w : (uint32_t)w * 1000);
     uint32_t rsp = gPptRsp;
     if (gLock) IOLockUnlock(gLock);
     IOLog("AmdCppc: ppt %d = %d W -> %08x (smu %x)\n", kind, w, r, rsp);
@@ -506,6 +510,7 @@ SYSCTL_PROC(_debug_amdcppc, OID_AUTO, epp, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LO
 SYSCTL_PROC(_debug_amdcppc, OID_AUTO, ppt_stapm, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, PPT_STAPM, ppt_sysctl, "I", "STAPM limit W");
 SYSCTL_PROC(_debug_amdcppc, OID_AUTO, ppt_slow, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, PPT_SLOW, ppt_sysctl, "I", "slow PPT W");
 SYSCTL_PROC(_debug_amdcppc, OID_AUTO, ppt_fast, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, PPT_FAST, ppt_sysctl, "I", "fast PPT W");
+SYSCTL_PROC(_debug_amdcppc, OID_AUTO, tctl_limit, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, PPT_TCTL, ppt_sysctl, "I", "Tctl target C");
 
 // Wake invalidates the energy/time baseline; defer hardware access to normal readers/policy.
 static IONotifier *gPowerNotifier;
@@ -527,7 +532,7 @@ class AmdCppc : public IOService {
 public:
     bool start(IOService *provider) override;
     void stop(IOService *provider) override;
-    // "AmdCppcSetPpt": p1 = kind (0 STAPM, 1 slow, 2 fast), p2 = milliwatts, p3 = uint32_t * SMU response (may be null)
+    // "AmdCppcSetPpt": p1 = kind (0 STAPM, 1 slow, 2 fast: p2 = milliwatts; 3 Tctl target: p2 = °C), p3 = uint32_t * SMU response
     IOReturn callPlatformFunction(const OSSymbol *name, bool wait, void *p1, void *p2, void *p3, void *p4) override;
 };
 OSDefineMetaClassAndStructors(AmdCppc, IOService)
@@ -565,6 +570,7 @@ bool AmdCppc::start(IOService *provider)
     sysctl_register_oid(&sysctl__debug_amdcppc_ppt_stapm);
     sysctl_register_oid(&sysctl__debug_amdcppc_ppt_slow);
     sysctl_register_oid(&sysctl__debug_amdcppc_ppt_fast);
+    sysctl_register_oid(&sysctl__debug_amdcppc_tctl_limit);
     gPowerNotifier = registerSleepWakeInterest(powerNotify, this);
     if (!gPowerNotifier) { stop(provider); return false; }
     registerService();
@@ -574,6 +580,7 @@ bool AmdCppc::start(IOService *provider)
 void AmdCppc::stop(IOService *provider)
 {
     if (gPowerNotifier) { gPowerNotifier->remove(); gPowerNotifier = nullptr; }
+    sysctl_unregister_oid(&sysctl__debug_amdcppc_tctl_limit);
     sysctl_unregister_oid(&sysctl__debug_amdcppc_ppt_fast);
     sysctl_unregister_oid(&sysctl__debug_amdcppc_ppt_slow);
     sysctl_unregister_oid(&sysctl__debug_amdcppc_ppt_stapm);

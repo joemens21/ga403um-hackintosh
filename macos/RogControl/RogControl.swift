@@ -33,6 +33,7 @@ struct AsusState {
     var kbd: Int? = nil, slash: Int? = nil, hid = false                   // ABI 3: keyboard light 0..3, Slash (packed), N-KEY seen
     var lighting = false                                                    // the kext has the keyboard / Slash settings
     var aura: Int? = nil, auraSupported = false                             // ABI 4: keyboard colour / effect (packed)
+    var abi5 = false, cpuTemp: Int? = nil, nvBoost: Int? = nil, nvTemp: Int? = nil   // ABI 5: temperature target, GPU controls
 }
 
 // Keyboard colour (asuswmi_abi.h ASUS_AURA_*): mode index, speed 0..2, 0xRRGGBB; one zone on the GA403
@@ -64,9 +65,9 @@ struct Slash: Equatable {
 }
 
 enum Asus {
-    static let abi: UInt32 = 4
+    static let abi: UInt32 = 5
     enum Sel: UInt32 { case state = 0, set = 1, fanRead = 2, fanWrite = 3, fanReset = 4 }
-    enum What: UInt64 { case profile = 1, spl = 2, sppt = 3, fppt = 4, charge = 5, backlight = 6, kbd = 7, slash = 8, aura = 9 }
+    enum What: UInt64 { case profile = 1, spl = 2, sppt = 3, fppt = 4, charge = 5, backlight = 6, kbd = 7, slash = 8, aura = 9, cpuTemp = 10, nvBoost = 11, nvTemp = 12 }
 
     static func open() -> io_connect_t? {
         let svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AsusWmi"))
@@ -96,7 +97,7 @@ enum Asus {
 
     static func state() -> AsusState {
         var s = AsusState()
-        let (kr, b) = call(.state, outCount: 28 * 4)                // an ABI 3 kext answers with 27 words
+        let (kr, b) = call(.state, outCount: 31 * 4)                // older kexts answer with fewer words
         guard kr == KERN_SUCCESS, b.count >= 24 * 4 else { return s }
         func w(_ i: Int) -> UInt32 { b.withUnsafeBytes { $0.load(fromByteOffset: i * 4, as: UInt32.self) } }
         guard w(0) >= 1, w(0) <= abi else { return s }          // ABI 1 / 2 / 3 (fewer words) still work
@@ -117,6 +118,9 @@ enum Asus {
         guard w(0) >= 4, b.count >= 28 * 4 else { return s }
         s.auraSupported = true
         s.aura = w(27) == ~0 ? nil : Int(w(27))
+        guard w(0) >= 5, b.count >= 31 * 4 else { return s }
+        s.abi5 = true
+        s.cpuTemp = w(28) == ~0 ? nil : Int(w(28)); s.nvBoost = w(29) == ~0 ? nil : Int(w(29)); s.nvTemp = w(30) == ~0 ? nil : Int(w(30))
         return s
     }
 
@@ -380,6 +384,11 @@ final class RogModel: ObservableObject {
     @Published var kbdTimeout = UserDefaults.standard.integer(forKey: "kbdTimeout")        // s, 0 = never
     @Published var kbdOffOnBattery = UserDefaults.standard.bool(forKey: "kbdOffOnBattery")
     @Published var kbdDimmed = false                         // the backlight is off for the timeout / battery rule
+    // 0 = leave it to the firmware
+    @Published var cpuTempLimit = UserDefaults.standard.integer(forKey: "cpuTempLimit")
+    @Published var nvBoost = UserDefaults.standard.integer(forKey: "nvBoost")
+    @Published var nvTemp = UserDefaults.standard.integer(forKey: "nvTemp")
+    @Published var thermalError = ""
     @Published var boostOn: Bool? = Boost.active()             // what the CPUs do now (nil: AmdCppc not loaded)
     @Published var boostWanted = Boost.wanted
     @Published var speakerDb: Double = Speakers.read() ?? -6
@@ -460,6 +469,32 @@ final class RogModel: ObservableObject {
     private func undim() { kbdDimmed = false; Asus.set(.kbd, kbd); st = Asus.state() }
     func setKbdTimeout(_ s: Int) { kbdTimeout = s; UserDefaults.standard.set(s, forKey: "kbdTimeout"); scheduleIdle() }
     func setKbdOffOnBattery(_ on: Bool) { kbdOffOnBattery = on; UserDefaults.standard.set(on, forKey: "kbdOffOnBattery"); scheduleIdle(); checkIdle() }
+    // a firmware profile change can reset these, so applyAll sends them again after every mode change
+    func applyThermal() {
+        guard st.abi5 else { return }
+        var errs: [String] = []
+        if cpuTempLimit > 0, Asus.set(.cpuTemp, cpuTempLimit) != KERN_SUCCESS { errs.append("CPU temperature limit refused") }
+        if nvBoost > 0, Asus.set(.nvBoost, nvBoost) != KERN_SUCCESS { errs.append("GPU Dynamic Boost refused by the BIOS") }
+        if nvTemp > 0, Asus.set(.nvTemp, nvTemp) != KERN_SUCCESS { errs.append("GPU temperature target refused by the BIOS") }
+        thermalError = errs.joined(separator: "; ")
+    }
+    func setCpuTempLimit(_ c: Int) {
+        cpuTempLimit = c; UserDefaults.standard.set(c, forKey: "cpuTempLimit")
+        let r = Asus.set(.cpuTemp, c == 0 ? 100 : c)                     // off: back to the highest target
+        thermalError = r == KERN_SUCCESS ? "" : "CPU temperature limit refused"
+        message = thermalError.isEmpty ? (c == 0 ? "CPU temperature limit off" : "CPU held at \(c) °C") : thermalError
+        st = Asus.state()
+    }
+    func setNv(boost: Int? = nil, temp: Int? = nil) {
+        if let b = boost { nvBoost = b; UserDefaults.standard.set(b, forKey: "nvBoost") }
+        if let t = temp { nvTemp = t; UserDefaults.standard.set(t, forKey: "nvTemp") }
+        var errs: [String] = []
+        if let b = boost, b > 0, Asus.set(.nvBoost, b) != KERN_SUCCESS { errs.append("GPU Dynamic Boost refused by the BIOS") }
+        if let t = temp, t > 0, Asus.set(.nvTemp, t) != KERN_SUCCESS { errs.append("GPU temperature target refused by the BIOS") }
+        thermalError = errs.joined(separator: "; ")
+        message = thermalError.isEmpty ? "GPU settings applied" : thermalError
+        st = Asus.state()
+    }
     func setBoost(_ on: Bool) {
         message = Boost.set(on) ? (on ? "CPU boost on until you turn it off or restart" : "CPU boost off") : "could not change the boost setting"
         boostWanted = Boost.wanted
@@ -529,7 +564,8 @@ final class RogModel: ObservableObject {
         if st.charge != charge, Asus.set(.charge, charge) != KERN_SUCCESS { chargeError = "Charge limit was not applied." }
         st = Asus.state()
         loadCurve()
-        let errs = [profileError, chargeError].filter { !$0.isEmpty }
+        applyThermal()
+        let errs = [profileError, chargeError, thermalError].filter { !$0.isEmpty }
         message = errs.isEmpty ? "\(settings.mode.title) applied (\(reason))" : errs.joined(separator: "; ")
         onChange?()
     }
@@ -846,6 +882,63 @@ struct FanEditor: View {
     }
 }
 
+// CPU temperature target (SMU) and NVIDIA Dynamic Boost / temperature target (ASUS WMI). A switch off = the firmware's value.
+struct ThermalControls: View {
+    @ObservedObject var m: RogModel
+    @State private var cpu: Double = 85
+    @State private var boost: Double = 15
+    @State private var gtemp: Double = 87
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if !m.st.abi5 {
+                Text("Needs AsusWmi ABI 5.").foregroundStyle(.secondary)
+            } else {
+                row("Limit CPU temperature", on: m.cpuTempLimit > 0, set: { on in m.setCpuTempLimit(on ? Int(cpu) : 0) }) {
+                    slider($cpu, 70...95, "°C") { m.setCpuTempLimit(Int(cpu)) }
+                }
+                Text("The CPU slows down before it passes this temperature. Off: the firmware's own limit.").font(.caption).foregroundStyle(.secondary)
+                Divider()
+                if m.st.nvBoost != nil {
+                    row("GPU Dynamic Boost", on: m.nvBoost > 0, set: { on in m.setNv(boost: on ? Int(boost) : 0) }) {
+                        slider($boost, 5...25, "W") { m.setNv(boost: Int(boost)) }
+                    }
+                }
+                if m.st.nvTemp != nil {
+                    row("GPU temperature target", on: m.nvTemp > 0, set: { on in m.setNv(temp: on ? Int(gtemp) : 0) }) {
+                        slider($gtemp, 75...87, "°C") { m.setNv(temp: Int(gtemp)) }
+                    }
+                }
+                if m.st.nvBoost == nil && m.st.nvTemp == nil {
+                    Text("The BIOS has no NVIDIA power controls.").font(.caption).foregroundStyle(.secondary)
+                } else {
+                    Text("Dynamic Boost moves power from the CPU to the GPU under GPU load; the target is where the GPU starts to slow down. "
+                         + "Off: the firmware's values (the BIOS may refuse changes).").font(.caption).foregroundStyle(.secondary)
+                }
+                if !m.thermalError.isEmpty {
+                    Label(m.thermalError, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.red)
+                }
+            }
+        }
+        .onAppear {
+            if m.cpuTempLimit > 0 { cpu = Double(m.cpuTempLimit) }
+            if m.nvBoost > 0 { boost = Double(m.nvBoost) } else if let b = m.st.nvBoost, (5...25).contains(b) { boost = Double(b) }
+            if m.nvTemp > 0 { gtemp = Double(m.nvTemp) } else if let t = m.st.nvTemp, (75...87).contains(t) { gtemp = Double(t) }
+        }
+    }
+    private func row<C: View>(_ title: String, on: Bool, set: @escaping (Bool) -> Void, @ViewBuilder _ content: () -> C) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Toggle(title, isOn: Binding(get: { on }, set: set)).toggleStyle(.switch).controlSize(.small).font(.system(size: 12))
+            if on { content() }
+        }
+    }
+    private func slider(_ v: Binding<Double>, _ r: ClosedRange<Double>, _ unit: String, done: @escaping () -> Void) -> some View {
+        HStack(spacing: 8) {
+            Slider(value: v, in: r, step: 1) { editing in if !editing { done() } }.controlSize(.small)
+            Text("\(Int(v.wrappedValue)) \(unit)").font(.system(size: 12)).monospacedDigit().frame(width: 50, alignment: .trailing)
+        }
+    }
+}
+
 // CPU boost switch: off by default and after every start
 struct BoostRow: View {
     @ObservedObject var m: RogModel
@@ -987,6 +1080,7 @@ struct RogControls: View {
                 }
             }
             if page == .performance {
+                RogSection(title: "Temperature & GPU") { ThermalControls(m: m) }
                 RogSection(title: "Power & cooling") {
                     VStack(alignment: .leading, spacing: 12) {
                         manualControls

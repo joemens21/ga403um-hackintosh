@@ -5,7 +5,7 @@
 #ifndef ASUSWMI_ABI_H
 #define ASUSWMI_ABI_H
 
-#define ASUSWMI_ABI_VERSION 4
+#define ASUSWMI_ABI_VERSION 5
 
 enum {
     kAsusUcGetState  = 0,   // out: struct, uint32_t[ASUS_ST_COUNT]
@@ -26,6 +26,9 @@ enum {                      // kAsusUcSet "what"
     ASUS_SET_KBD     = 7,   // keyboard backlight 0..3 (N-KEY HID feature report 0x5A)
     ASUS_SET_SLASH   = 8,   // Slash lighting: ASUS_SLASH_PACK(mode, brightness, interval); brightness 0 = off
     ASUS_SET_AURA    = 9,   // keyboard colour and effect (ABI 4): ASUS_AURA_PACK(mode, speed, 0xRRGGBB)
+    ASUS_SET_CPU_TEMP = 10, // ABI 5: CPU temperature target °C 60..100 (AmdCppc, SMU set_tctl_temp)
+    ASUS_SET_NV_BOOST = 11, // ABI 5: NVIDIA Dynamic Boost W 5..25 (WMI 0x001200C0)
+    ASUS_SET_NV_TEMP  = 12, // ABI 5: NVIDIA temperature target °C 75..87 (WMI 0x001200C2)
 };
 
 enum {                      // kAsusUcGetState words
@@ -54,9 +57,12 @@ enum {                      // kAsusUcGetState words
     ASUS_ST_SLASH,          // Slash setting as last set (ASUS_SLASH_PACK), 0xFFFFFFFF unknown
     ASUS_ST_HID,            // 1: the N-KEY keyboard (0b05:19b6) was found
     ASUS_ST_AURA,           // ABI 4: keyboard colour / effect as last set (ASUS_AURA_PACK), 0xFFFFFFFF unknown
-    ASUS_ST_COUNT = 28
+    ASUS_ST_CPU_TEMP,       // ABI 5: CPU temperature target °C as last set since boot, 0xFFFFFFFF not set (firmware's own)
+    ASUS_ST_NV_BOOST,       // ABI 5: NVIDIA Dynamic Boost W (last set, else the firmware's DSTS value), 0xFFFFFFFF no device
+    ASUS_ST_NV_TEMP,        // ABI 5: NVIDIA temperature target °C (same rule), 0xFFFFFFFF no device
+    ASUS_ST_COUNT = 31
 };
-#define ASUS_ST_COUNT_V3 27 // ABI 3 clients ask for this many words; they still get them
+#define ASUS_ST_COUNT_V3 27 // older clients ask for fewer words (ABI 3: 27, ABI 4: 28); they get what they ask for
 
 #define ASUS_FL_AC         0x1u    // on AC power (ACPI0003 _PSR)
 #define ASUS_FL_FAN_CUSTOM 0x2u    // a custom fan curve is active (written since the last profile change)

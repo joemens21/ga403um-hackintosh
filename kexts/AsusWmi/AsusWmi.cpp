@@ -35,6 +35,8 @@
 //   sysctl debug.asuswmi.kbd[=<0..3>]      keyboard backlight (N-KEY HID 0b05:19b6, feature report 0x5A, as G-Helper / hid-asus)
 //   sysctl debug.asuswmi.slash[=<packed>]  Slash lighting, ASUS_SLASH_PACK(mode, brightness 0..3, interval 0..5) (report 0x5D)
 //   sysctl debug.asuswmi.aura[=<packed>]   keyboard colour / effect, ASUS_AURA_PACK(mode, speed 0..2, 0xRRGGBB) (report 0x5D)
+//   sysctl debug.asuswmi.cpu_temp=<°C>     CPU temperature target 60..100 through AmdCppc's SMU path (ABI 5)
+//   sysctl debug.asuswmi.nv_boost=<W>      NVIDIA Dynamic Boost 5..25 W (0x001200C0); nv_temp=<°C> temperature target 75..87 (0x001200C2)
 //   sysctl debug.asuswmi.key=<code>        emulates a hotkey through WMNB DEVS 0x00100021 (EC0.SKEY): 0x20 brightness up,
 //                                          0x10 down, 0xC4 / 0xC5 keyboard light up / down, 0xAE fan key (testing)
 // Hotkeys: the EC queues a code with ATKD.IANE and sends Notify (ATKD, 0xFF); _WED (0xFF) returns the queued codes. Handled
@@ -147,6 +149,8 @@ public:
     IOReturn slashApply(uint32_t packed);
     IOReturn auraApply(uint32_t packed);
     IOReturn smuPpt(int i, int watts);
+    IOReturn smuCall(int kind, uint32_t value);
+    int cpuTempSet = -1, nvBoostSet = -1, nvTempSet = -1;        // ABI 5: last values set since boot
     bool pptSmu = false;                                         // the last power limit went through AmdCppc's SMU path
     // -1 not asked yet; 1 DSTS of DEV_PPT_SPL has the present bit; 0 absent, or the BIOS refused a limit the SMU then took
     // (the GA403UM's DSTS claims the device but DEVS fails: the path that actually worked decides the ranges)
@@ -392,16 +396,18 @@ IOReturn AsusWmi::slashApply(uint32_t v)
 }
 
 // Power limits through AmdCppc (it owns the SMN index/data pair and the SMU mailbox): SPL -> STAPM, SPPT -> slow, FPPT -> fast
-IOReturn AsusWmi::smuPpt(int i, int watts)
+IOReturn AsusWmi::smuPpt(int i, int watts) { return smuCall(i, (uint32_t)watts * 1000); }
+
+// kind 0..2: power limits in mW, 3: CPU temperature target in °C (AmdCppc "AmdCppcSetPpt")
+IOReturn AsusWmi::smuCall(int kind, uint32_t value)
 {
-    static const uintptr_t kKind[3] = { 0, 1, 2 };
     OSDictionary *m = IOService::serviceMatching("AmdCppc");
     if (!m) return kIOReturnNoMemory;
     IOService *cppc = IOService::copyMatchingService(m);
     m->release();
     if (!cppc) return kIOReturnNotFound;
     uint32_t rsp = 0;
-    IOReturn r = cppc->callPlatformFunction("AmdCppcSetPpt", false, (void *)kKind[i], (void *)(uintptr_t)(watts * 1000), &rsp, nullptr);
+    IOReturn r = cppc->callPlatformFunction("AmdCppcSetPpt", false, (void *)(uintptr_t)kind, (void *)(uintptr_t)value, &rsp, nullptr);
     cppc->release();
     return r;
 }
@@ -563,6 +569,23 @@ IOReturn AsusWmi::setValue(int what, int v)
         return v < 0 ? kIOReturnBadArgument : slashApply((uint32_t)v);
     case ASUS_SET_AURA:
         return v < 0 ? kIOReturnBadArgument : auraApply((uint32_t)v);
+    case ASUS_SET_CPU_TEMP: {
+        if (v < 60 || v > 100) return kIOReturnBadArgument;
+        IOReturn r = smuCall(3, (uint32_t)v);
+        if (r == kIOReturnSuccess) cpuTempSet = v;
+        say("cpu temp %d C -> smu %08x", v, r);
+        return r;
+    }
+    case ASUS_SET_NV_BOOST:                                      // asus-armoury ranges for the GA403
+        if (v < 5 || v > 25) return kIOReturnBadArgument;
+        ok = devs(DEV_NV_BOOST, (uint32_t)v, &ret);
+        if (ok) nvBoostSet = v;
+        break;
+    case ASUS_SET_NV_TEMP:
+        if (v < 75 || v > 87) return kIOReturnBadArgument;
+        ok = devs(DEV_NV_TEMP, (uint32_t)v, &ret);
+        if (ok) nvTempSet = v;
+        break;
     default:
         return kIOReturnUnsupported;
     }
@@ -654,6 +677,9 @@ void AsusWmi::getState(uint32_t st[ASUS_ST_COUNT])
     st[ASUS_ST_SLASH] = slashSet >= 0 ? (uint32_t)slashSet : ~0u;
     st[ASUS_ST_HID] = hidSeen ? 1 : 0;
     st[ASUS_ST_AURA] = auraSet >= 0 ? (uint32_t)auraSet : ~0u;
+    st[ASUS_ST_CPU_TEMP] = cpuTempSet >= 0 ? (uint32_t)cpuTempSet : ~0u;
+    st[ASUS_ST_NV_BOOST] = nvBoostSet >= 0 ? (uint32_t)nvBoostSet : dsts(DEV_NV_BOOST, &v) && (v & DSTS_PRESENT) ? (v & 0xffff) : ~0u;
+    st[ASUS_ST_NV_TEMP] = nvTempSet >= 0 ? (uint32_t)nvTempSet : dsts(DEV_NV_TEMP, &v) && (v & DSTS_PRESENT) ? (v & 0xffff) : ~0u;
 }
 
 // getACPITableData() is protected; this type is never instantiated, it only makes the (virtual) call reachable.
@@ -834,6 +860,9 @@ static int write_sysctl SYSCTL_HANDLER_ARGS
     else if (what == ASUS_SET_KBD) v = gSelf->kbdLevel;
     else if (what == ASUS_SET_SLASH) v = (int)gSelf->slashSet;
     else if (what == ASUS_SET_AURA) v = (int)gSelf->auraSet;
+    else if (what == ASUS_SET_CPU_TEMP) v = gSelf->cpuTempSet;
+    else if (what == ASUS_SET_NV_BOOST) v = gSelf->nvBoostSet;
+    else if (what == ASUS_SET_NV_TEMP) v = gSelf->nvTempSet;
     else if (what == W_KEY) v = (int)gSelf->lastKey;
     IOLockUnlock(gSelf->lock);
     int e = sysctl_handle_int(oidp, &v, 0, req);
@@ -900,6 +929,9 @@ SYSCTL_PROC(_debug_asuswmi, OID_AUTO, ec_reg, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG
 SYSCTL_PROC(_debug_asuswmi, OID_AUTO, kbd, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, ASUS_SET_KBD, write_sysctl, "I", "");
 SYSCTL_PROC(_debug_asuswmi, OID_AUTO, slash, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, ASUS_SET_SLASH, write_sysctl, "I", "");
 SYSCTL_PROC(_debug_asuswmi, OID_AUTO, aura, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, ASUS_SET_AURA, write_sysctl, "I", "");
+SYSCTL_PROC(_debug_asuswmi, OID_AUTO, cpu_temp, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, ASUS_SET_CPU_TEMP, write_sysctl, "I", "");
+SYSCTL_PROC(_debug_asuswmi, OID_AUTO, nv_boost, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, ASUS_SET_NV_BOOST, write_sysctl, "I", "");
+SYSCTL_PROC(_debug_asuswmi, OID_AUTO, nv_temp, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, ASUS_SET_NV_TEMP, write_sysctl, "I", "");
 SYSCTL_PROC(_debug_asuswmi, OID_AUTO, key, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, W_KEY, write_sysctl, "I", "");
 
 static struct sysctl_oid *const kOids[] = {
@@ -908,6 +940,7 @@ static struct sysctl_oid *const kOids[] = {
     &sysctl__debug_asuswmi_charge_limit, &sysctl__debug_asuswmi_dumpacpi, &sysctl__debug_asuswmi_probe,
     &sysctl__debug_asuswmi_backlight, &sysctl__debug_asuswmi_battery, &sysctl__debug_asuswmi_ec_reg,
     &sysctl__debug_asuswmi_kbd, &sysctl__debug_asuswmi_slash, &sysctl__debug_asuswmi_aura, &sysctl__debug_asuswmi_key,
+    &sysctl__debug_asuswmi_cpu_temp, &sysctl__debug_asuswmi_nv_boost, &sysctl__debug_asuswmi_nv_temp,
 };
 
 bool AsusWmi::start(IOService *provider)
