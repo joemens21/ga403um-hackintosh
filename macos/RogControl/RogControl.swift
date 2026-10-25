@@ -326,6 +326,25 @@ struct Sample: Identifiable {
     let cpuC: Double?, gpuC: Double?, cpuW: Double?, cpuRpm: Int, gpuRpm: Int
 }
 
+// CPU boost: the com.g14.boostoff daemon (root) keeps boost off through AmdCppc unless this flag exists, and removes a flag
+// older than the current boot, so boost is off after every start. The folder belongs to the user: no sudo here.
+enum Boost {
+    static let dir = "/Users/Shared/G14", flag = dir + "/boost-allow"
+    static var available: Bool { FileManager.default.isWritableFile(atPath: dir) }
+    static var wanted: Bool { FileManager.default.fileExists(atPath: flag) }
+    // from debug.amdcppc.report: on when any CPU has CpbDis=0
+    static func active() -> Bool? {
+        guard let r = Sensors.string("debug.amdcppc.report") else { return nil }
+        if r.contains("CpbDis=0") { return true }
+        return r.contains("CpbDis=1") ? false : nil
+    }
+    static func set(_ on: Bool) -> Bool {
+        if on { return FileManager.default.createFile(atPath: flag, contents: Data()) }
+        try? FileManager.default.removeItem(atPath: flag)
+        return !wanted
+    }
+}
+
 // Speaker amp level: the strixamp daemon re-reads this file every 3 s (key "volume", dB, -60...0; other keys are kept)
 enum Speakers {
     static var url: URL { FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/RogAudio/settings.plist") }
@@ -361,6 +380,8 @@ final class RogModel: ObservableObject {
     @Published var kbdTimeout = UserDefaults.standard.integer(forKey: "kbdTimeout")        // s, 0 = never
     @Published var kbdOffOnBattery = UserDefaults.standard.bool(forKey: "kbdOffOnBattery")
     @Published var kbdDimmed = false                         // the backlight is off for the timeout / battery rule
+    @Published var boostOn: Bool? = Boost.active()             // what the CPUs do now (nil: AmdCppc not loaded)
+    @Published var boostWanted = Boost.wanted
     @Published var speakerDb: Double = Speakers.read() ?? -6
     @Published var speakerApplied = Speakers.applied()
     private var idleTimer: Timer?
@@ -439,6 +460,14 @@ final class RogModel: ObservableObject {
     private func undim() { kbdDimmed = false; Asus.set(.kbd, kbd); st = Asus.state() }
     func setKbdTimeout(_ s: Int) { kbdTimeout = s; UserDefaults.standard.set(s, forKey: "kbdTimeout"); scheduleIdle() }
     func setKbdOffOnBattery(_ on: Bool) { kbdOffOnBattery = on; UserDefaults.standard.set(on, forKey: "kbdOffOnBattery"); scheduleIdle(); checkIdle() }
+    func setBoost(_ on: Bool) {
+        message = Boost.set(on) ? (on ? "CPU boost on until you turn it off or restart" : "CPU boost off") : "could not change the boost setting"
+        boostWanted = Boost.wanted
+        // the daemon reacts to the flag folder within a second or two
+        for d in [1.5, 4.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + d) { [weak self] in MainActor.assumeIsolated { self?.boostOn = Boost.active() } }
+        }
+    }
     func setSpeaker(_ db: Double) {
         speakerDb = db
         message = Speakers.write(db) ? String(format: "speaker level %.0f dB (applied by the amp daemon within 3 s)", db) : "could not write the speaker settings"
@@ -470,6 +499,7 @@ final class RogModel: ObservableObject {
         var g = nvgpu_stat()
         gpu = nvgpu_read(&g) == 0 ? g : nil
         cpuMHz = Sensors.clock()
+        boostOn = Boost.active(); boostWanted = Boost.wanted
         battery = BatteryInfo.read()
         if visible { speakerApplied = Speakers.applied() }
         // the keyboard level can change from Fn+F2 / F3 in the kext: adopt it as the setting (not while dimmed by the timeout)
@@ -816,6 +846,33 @@ struct FanEditor: View {
     }
 }
 
+// CPU boost switch: off by default and after every start
+struct BoostRow: View {
+    @ObservedObject var m: RogModel
+    var compact = false
+    var body: some View {
+        if Boost.available {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Toggle("CPU boost", isOn: Binding(get: { m.boostWanted }, set: { m.setBoost($0) }))
+                        .toggleStyle(.switch).controlSize(.small).font(.system(size: 12))
+                    Spacer()
+                    Text(state).font(.caption).foregroundStyle(m.boostOn == true ? Color.orange : Color.secondary)
+                }
+                if !compact {
+                    Text("Off after every restart. On: up to 5.2 GHz, more heat and fan noise; the power limits still apply.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+    private var state: String {
+        guard let on = m.boostOn else { return "AmdCppc not loaded" }
+        if on != m.boostWanted { return "switching…" }
+        return on ? "boosting allowed" : "off (max 4.0 GHz)"
+    }
+}
+
 // CS35L56 amp level through the strixamp daemon's settings file
 struct SpeakerControls: View {
     @ObservedObject var m: RogModel
@@ -922,7 +979,12 @@ struct RogControls: View {
                 }
             }
             if page == .overview || page == .performance {
-                RogSection(title: "Performance mode") { modes.disabled(!m.st.present) }
+                RogSection(title: "Performance mode") {
+                    VStack(alignment: .leading, spacing: 12) {
+                        modes.disabled(!m.st.present)
+                        BoostRow(m: m)
+                    }
+                }
             }
             if page == .performance {
                 RogSection(title: "Power & cooling") {
@@ -1251,6 +1313,7 @@ struct ContentView: View {
                 }
             }
             ModeRow(active: m.activeMode, ac: m.st.ac, compact: true) { m.choose($0) }.disabled(!m.st.present)
+            BoostRow(m: m, compact: true)
             HStack {
                 Text("Active: \(m.modeLabel)").font(.caption).foregroundStyle(.secondary)
                 Spacer()
