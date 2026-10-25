@@ -19,6 +19,7 @@
 // Appends "; <text>" to the registry property "itlmt_native_trace" of `e` (cap 480 bytes). IOLog output of third-party kexts was
 // not found in the collected logs of stage A/B, a registry property survives and is read with `ioreg -l`.
 void itlmtTrace(IORegistryEntry *e, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+void itlmtAssocLog(IORegistryEntry *e, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 
 // Call recorder: one table of (kind, id, up to 3 caller addresses) -> count, published as the registry property
 // "itlmt_native_calls" of `e` whenever an entry is new or its count reaches a power of two, so it survives panic-free runs and
@@ -85,10 +86,13 @@ private:
     // scan / join (stage 3): requests are handed to the core through ITL_NATIVE_*; results are posted from the datapath tick
     void pollControl();
     void deliverScanResults();
+    bool ssidIsOpen(const uint8_t *ssid, uint32_t len);
     void finishJoin(const ItlNativeStatus &st, bool ok);
     void postLinkStatus(const uint8_t *bssid, bool up, uint32_t reason);
     void postEvent(uint32_t code, void *data, size_t length);
     bool queryStatus(ItlNativeStatus *st);
+    bool eapWatch = false;                  // an 802.1X join is up unauthorised: post 0xa when the core authorises it (rxLock)
+    uint32_t eapTicks = 0;
     ItlNativeAp *snap = nullptr;            // ITL_NATIVE_AP_MAX entries: scratch for ITL_NATIVE_NETS (tick thread only)
     bool scanActive = false, scanImmediate = false, joinActive = false;
     uint32_t scanGenAtReq = 0, scanTicks = 0, joinSeq = 0, joinTicks = 0, controlTicks = 0, scanTraced = 0;

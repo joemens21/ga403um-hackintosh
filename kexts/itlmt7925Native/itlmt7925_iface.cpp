@@ -57,6 +57,33 @@ inline void rel(OSObject *o)
 
 }
 
+// Join log: the last join requests and what became of them, in their own registry property (itlmt_native_assoc) so the startup
+// trace cannot crowd them out. Oldest entries are dropped once it passes 1400 characters.
+void itlmtAssocLog(IORegistryEntry *e, const char *fmt, ...)
+{
+    if (!e) return;
+    char add[200];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(add, sizeof(add), fmt, ap);
+    va_end(ap);
+    char buf[1700];
+    buf[0] = 0;
+    OSObject *o = e->copyProperty("itlmt_native_assoc");
+    if (OSString *old = OSDynamicCast(OSString, o)) strlcpy(buf, old->getCStringNoCopy(), sizeof(buf));
+    if (o) o->release();
+    if (buf[0]) strlcat(buf, "; ", sizeof(buf));
+    strlcat(buf, add, sizeof(buf));
+    size_t len = strlen(buf), cut = 0;
+    while (len - cut > 1400) {                               // drop whole entries from the front
+        size_t i = cut;
+        while (i + 1 < len && !(buf[i] == ';' && buf[i + 1] == ' ')) i++;
+        if (i + 1 >= len) break;
+        cut = i + 2;
+    }
+    e->setProperty("itlmt_native_assoc", buf + cut);
+}
+
 void itlmtTrace(IORegistryEntry *e, const char *fmt, ...)
 {
     if (!e) return;
@@ -952,8 +979,14 @@ namespace {
 const uint32_t kBeaconHeader = 0x40;
 const uint32_t kEventScanResult = 0xc9, kEventScanDone = 0xed, kEventAssoc = 0x4e, kEventJoin = 0xd3, kEventFirstBeacon = 0xd4,
                kEventConnect = 0xd5, kEventLinkStatus = 0xd8;
+// eapolclient learns that the 4-way handshake is done from an IOKit interest notification, not from an 80211 event: after
+// EAP it schedules "4-way handshake notification" = IOServiceAddInterestNotification(IOGeneralInterest) on the second parent of
+// the BSD interface (en4 -> IOSkywalkLegacyEthernet -> this interface) and takes any kIOMessageServicePropertyChange as
+// "4-way handshake complete" (eapolclient 15.8.1: callback 0x10000f0b7 compares the type with 0xe0000130). So the interface
+// sends that message once the core authorised the port.
 // 20 MHz channels the core's scan covers (itlmt7925_m2.cpp): the only channels a result can come from.
-const uint8_t kScanChannels[] = {1, 6, 11, 36, 40, 44, 48, 149, 153, 157, 161, 165};
+// the channels the core's scan request covers (itlmt7925_m2.cpp, UNI_SCAN_CHANNEL): 2.4 GHz 1..11, 5 GHz UNII-1 and UNII-3
+const uint8_t kScanChannels[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 36, 40, 44, 48, 149, 153, 157, 161, 165};
 const uint32_t kScanTimeoutTicks = 2500;       // 25 s at the 10 ms tick: the core blocks up to 15 s per scan
 const uint32_t kJoinTimeoutTicks = 4500;       // 45 s: scan for the AP, authentication, association, handshake
 
@@ -1058,9 +1091,39 @@ IOReturn itlmt7925WifiInterface::setWCL_SCAN_ABORT(void *)
     return kIOReturnSuccess;
 }
 
+// A request without a key is an open network *or* an 802.1X / SAE one (Apple's supplicant hands those over the same way), so
+// the beacons decide: open only if the SSID was heard in the last minute and every BSS of it has neither PRIVACY nor an RSN / WPA
+// element. Anything else keeps the old answer (unsupported) and never reaches the core as an open join.
+bool itlmt7925WifiInterface::ssidIsOpen(const uint8_t *ssid, uint32_t len)
+{
+    ItlNativeAp *aps = (ItlNativeAp *)IOMalloc(sizeof(ItlNativeAp) * ITL_NATIVE_AP_MAX);
+    if (!aps) return false;
+    ItlNativeNets n;
+    bzero(&n, sizeof(n));
+    n.version = 1;
+    n.max = ITL_NATIVE_AP_MAX;
+    n.aps = aps;
+    uint32_t open = 0, secured = 0;
+    if (core && core->callPlatformFunction(ITL_NATIVE_NETS, false, &n, nullptr, nullptr, nullptr) == kIOReturnSuccess) {
+        for (uint32_t i = 0; i < n.count && i < ITL_NATIVE_AP_MAX; i++) {
+            const ItlNativeAp &a = aps[i];
+            if (a.ageMs > 60000 || a.ssidLen != len || memcmp(a.ssid, ssid, len)) continue;
+            bool sec = (a.capability & 0x0010) != 0;
+            for (uint32_t o = 0; !sec && o + 2 <= a.ieLen && o + 2 + a.ie[o + 1] <= a.ieLen; o += 2 + a.ie[o + 1]) {
+                const uint8_t *e = a.ie + o;
+                if (e[0] == 0x30) sec = true;                                                          // RSN
+                if (e[0] == 0xdd && e[1] >= 4 && e[2] == 0x00 && e[3] == 0x50 && e[4] == 0xf2 && e[5] == 1) sec = true;   // WPA
+            }
+            if (sec) secured++; else open++;
+        }
+    }
+    IOFree(aps, sizeof(ItlNativeAp) * ITL_NATIVE_AP_MAX);
+    return open > 0 && secured == 0;
+}
+
 // apple80211AssocCandidates (partial): +0x1c u32 ssid_len, +0x20 ssid[32], +0x40 apple80211_key {+4 key_len, +8 cipher_type,
 // +0x10 key[]}. Apple's supplicant runs in userland: cipher_type 6 / 9 with a 32-byte key is the pairwise master key (derived
-// from the passphrase), 0 is "no key". The 4-way handshake and the data keys are the core's; it supports WPA2-PSK / CCMP only.
+// from the passphrase), 0 is "no key" (an open network). The 4-way handshake and the data keys are the core's: WPA2-PSK / CCMP.
 IOReturn itlmt7925WifiInterface::setWCL_ASSOCIATE(apple80211AssocCandidates *d)
 {
     itlmtCall(ctl, 'S', 595);
@@ -1073,16 +1136,49 @@ IOReturn itlmt7925WifiInterface::setWCL_ASSOCIATE(apple80211AssocCandidates *d)
     memcpy(&cipher, b + 0x48, 4);
     itlmtTrace(ctl, "assoc:request ssidLen=%u cipher=%u keyLen=%u", ssidLen, cipher, keyLen);
     if (ssidLen == 0 || ssidLen > 32) return kIOReturnBadArgument;
-    if (!((cipher == 6 || cipher == 9) && keyLen == 32)) return kIOReturnUnsupported;   // open / SAE / enterprise: not implemented
+    // no key at all and only open beacons for the SSID: an open network (the core checks PRIVACY again before it associates)
+    const bool open = cipher == 0 && keyLen == 0 && ssidIsOpen(b + 0x20, ssidLen);
+    // Every join request goes to the join log with the fields AppleBCMWLANCore::setWCL_ASSOCIATE / AppleBCMWLANJoinAdapter::
+    // performJoin read (0xffffff8001608554 / 0xffffff80015845b2, 24H32): auth type lower +0x10, upper +0x14 / +0x18, the RSN
+    // element the supplicant built (+0xd4 u16 length, +0xd6 bytes), flags +0x1e0, auth context +0x210. Never the key bytes.
+    {
+        uint32_t lower = 0, upper = 0, upper2 = 0, actx = 0;
+        uint16_t rsnLen = 0, flags = 0;
+        memcpy(&lower, b + 0x10, 4);
+        memcpy(&upper, b + 0x14, 4);
+        memcpy(&upper2, b + 0x18, 4);
+        memcpy(&rsnLen, b + 0xd4, 2);
+        memcpy(&flags, b + 0x1e0, 2);
+        memcpy(&actx, b + 0x210, 4);
+        itlmtAssocLog(ctl, "req ssidLen=%u lower=%x upper=%x/%x cipher=%u keyLen=%u flags=%04x actx=%x", ssidLen, lower, upper,
+                      upper2, cipher, keyLen, flags, actx);
+        char h[2 * 48 + 1];
+        uint32_t n = rsnLen < 48 ? rsnLen : 48;
+        h[0] = 0;
+        for (uint32_t i = 0; i < n; i++) snprintf(h + 2 * i, 3, "%02x", b[0xd6 + i]);
+        itlmtAssocLog(ctl, "rsn(%u)=%s", rsnLen, h);
+    }
+    // 802.1X: upper auth type 0x800 (the captured eduroam request; docs/ENTERPRISE-WIFI.md) and no key. The core associates
+    // with AKM 1, brings the link up unauthorised and passes EAP to the supplicant; the PMK arrives later (phase 3).
+    uint32_t upperAuth = 0;
+    memcpy(&upperAuth, b + 0x14, 4);
+    const bool eap = !open && cipher == 0 && keyLen == 0 && upperAuth == 0x800;
+    if (!open && !eap && !((cipher == 6 || cipher == 9) && keyLen == 32)) {                      // SAE: not implemented
+        itlmtAssocLog(ctl, "-> unsupported");
+        return kIOReturnUnsupported;
+    }
     ItlNativeJoin j;
     bzero(&j, sizeof(j));
-    j.version = 1;
+    j.version = eap ? 3 : open ? 2 : 1;
     j.ssidLen = (uint8_t)ssidLen;
     memcpy(j.ssid, b + 0x20, ssidLen);
-    memcpy(j.pmk, b + 0x50, 32);
+    if (open) j.open = 1;
+    else if (eap) j.eap = 1;
+    else memcpy(j.pmk, b + 0x50, 32);
     IOReturn r = core->callPlatformFunction(ITL_NATIVE_JOIN, false, &j, nullptr, nullptr, nullptr);
     bzero(&j, sizeof(j));
-    if (r != kIOReturnSuccess) { itlmtTrace(ctl, "assoc:core join=%x", r); return r; }
+    if (r != kIOReturnSuccess) { itlmtTrace(ctl, "assoc:core join=%x", r); itlmtAssocLog(ctl, "-> core join=%x", r); return r; }
+    itlmtAssocLog(ctl, "-> %s join started", open ? "open" : eap ? "8021x" : "psk");
     ItlNativeStatus st;
     bzero(&st, sizeof(st));
     queryStatus(&st);
@@ -1090,8 +1186,40 @@ IOReturn itlmt7925WifiInterface::setWCL_ASSOCIATE(apple80211AssocCandidates *d)
     joinSeq = st.joinSeq;
     joinTicks = 0;
     joinActive = true;
+    eapWatch = eap;
+    eapTicks = 0;
     IOLockUnlock(rxLock);
     return kIOReturnSuccess;
+}
+
+// apple80211_key, as AppleBCMWLANCore::setCIPHER_KEY (0xffffff800160dc76, 24H32) logs it: +4 key length, +8 cipher type, +0xc u16
+// index, +0xe u16 flags, +0x10 key bytes, +0x50 RSC length (148 bytes in all). eapolclient sends it on an 802.1X link: a clear
+// (length 0) when it starts, the PMK (cipher 6 / 9, the first 32 bytes of the MSK) once EAP succeeded. The PMK goes to the core,
+// which runs the 4-way handshake with it; the key bytes are never logged.
+IOReturn itlmt7925WifiInterface::setCIPHER_KEY(apple80211_key *k)
+{
+    itlmtCall(ctl, 'S', 538);
+    if (!k) return kIOReturnBadArgument;
+    const uint8_t *b = (const uint8_t *)k;
+    uint32_t len = 0, cipher = 0;
+    uint16_t index = 0, flags = 0;
+    memcpy(&len, b + 4, 4);
+    memcpy(&cipher, b + 8, 4);
+    memcpy(&index, b + 0xc, 2);
+    memcpy(&flags, b + 0xe, 2);
+    itlmtAssocLog(ctl, "cipher_key cipher=%u len=%u idx=%u flags=%x", cipher, len, index, flags);
+    if (len == 0) return kIOReturnSuccess;                                  // clear: nothing is installed before the handshake
+    if (!((cipher == 6 || cipher == 9) && (len == 32 || len == 64))) {
+        itlmtAssocLog(ctl, "-> cipher_key unsupported");
+        return kIOReturnUnsupported;
+    }
+    if (!bound || !core) return kIOReturnNotReady;
+    uint8_t pmk[32];
+    memcpy(pmk, b + 0x10, sizeof(pmk));
+    IOReturn r = core->callPlatformFunction(ITL_NATIVE_PMK, false, pmk, nullptr, nullptr, nullptr);
+    bzero(pmk, sizeof(pmk));
+    itlmtAssocLog(ctl, "-> pmk to core=%x", r);
+    return r;
 }
 
 IOReturn itlmt7925WifiInterface::setWCL_LEAVE_NETWORK(apple80211_leave_network *)
@@ -1103,6 +1231,7 @@ IOReturn itlmt7925WifiInterface::setWCL_LEAVE_NETWORK(apple80211_leave_network *
     if (!core || !bound) return kIOReturnNotReady;
     IOReturn r = core->callPlatformFunction(ITL_NATIVE_LEAVE, false, nullptr, nullptr, nullptr, nullptr);
     itlmtTrace(ctl, "assoc:leave=%x", r);
+    itlmtAssocLog(ctl, "leave=%x", r);
     return kIOReturnSuccess;
 }
 
@@ -1367,6 +1496,7 @@ void itlmt7925WifiInterface::finishJoin(const ItlNativeStatus &st, bool ok)
         postEvent(kEventConnect, done, sizeof(done));
     }
     itlmtTrace(ctl, "assoc:result ok=%u stage=%u", ok, st.failStage);
+    itlmtAssocLog(ctl, "result ok=%u stage=%u", ok, st.failStage);
 }
 
 // Event 0xd8 (WCLNetManager::linkStatusInd): +0 ether_addr bssid, +6 u8 link up (0 = down), +8 u32 down reason
@@ -1406,6 +1536,26 @@ void itlmt7925WifiInterface::pollControl()
         if (want && queryStatus(&rs) && rs.state == ITL_NATIVE_UP && rs.channel) {
             if (reannounceTraced++ < 4) itlmtTrace(ctl, "wcl:link restored by core, announcing again ch=%u", rs.channel);
             finishJoin(rs, true);
+        }
+    }
+    // 802.1X: once the core installed the keys, tell eapolclient (once per join); stop watching when the link is gone
+    IOLockLock(rxLock);
+    bool ew = eapWatch && !ja;
+    IOLockUnlock(rxLock);
+    if (ew && (++eapTicks % 10) == 0) {
+        ItlNativeStatus es;
+        if (queryStatus(&es)) {
+            bool done = es.eapState == 2, gone = es.state != ITL_NATIVE_UP || es.eapState == 0;
+            if (done || gone) {
+                IOLockLock(rxLock);
+                eapWatch = false;
+                IOLockUnlock(rxLock);
+            }
+            if (done) {
+                setProperty("itlmt_8021x_authorised", true);
+                messageClients(kIOMessageServicePropertyChange);
+                itlmtAssocLog(ctl, "8021x authorised -> property change message");
+            } else if (gone) itlmtAssocLog(ctl, "8021x link gone before authorisation");
         }
     }
     if (!sa && !ja) return;

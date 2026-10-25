@@ -215,7 +215,7 @@ void itlmt7925::rxParseFrame(const uint8_t *p, uint32_t len)
 
         rxBeacons++;
         if (ch < sizeof(chHist)) chHist[ch]++;
-        m3Capture(p + off, len - off, ssid, ch);
+        m3Capture(p + off, len - off, ssid, ch, rxRssi(p, len, off));
         apSeen(p, len, off, ssid, ch);
         return;
     }

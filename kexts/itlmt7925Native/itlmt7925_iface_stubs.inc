@@ -254,7 +254,6 @@ IOReturn itlmt7925WifiInterface::getWIFI_NOISE_PER_ANT(apple80211_noise_per_ant_
 IOReturn itlmt7925WifiInterface::getFW_CLOCK_INFO(apple80211_fw_clock_info* a1) { itlmtCall(ctl, 'S', 535); return kIOReturnUnsupported; }
 IOReturn itlmt7925WifiInterface::getTIMESYNC_STATS(apple80211_timesync_stats* a1) { itlmtCall(ctl, 'S', 536); return kIOReturnUnsupported; }
 IOReturn itlmt7925WifiInterface::getSYSTEM_SLEEP_CONFIG(apple80211_system_sleep_config* a1) { itlmtCall(ctl, 'S', 537); return kIOReturnUnsupported; }
-IOReturn itlmt7925WifiInterface::setCIPHER_KEY(apple80211_key* a1) { itlmtCall(ctl, 'S', 538); return kIOReturnUnsupported; }
 IOReturn itlmt7925WifiInterface::setCHANNEL(apple80211_channel_data* a1) { itlmtCall(ctl, 'S', 539); return kIOReturnUnsupported; }
 IOReturn itlmt7925WifiInterface::setPOWERSAVE(apple80211_powersave_data* a1) { itlmtCall(ctl, 'S', 540); return kIOReturnUnsupported; }
 IOReturn itlmt7925WifiInterface::setTXPOWER(apple80211_txpower_data* a1) { itlmtCall(ctl, 'S', 541); return kIOReturnUnsupported; }
