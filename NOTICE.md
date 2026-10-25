@@ -1,6 +1,8 @@
 # Third-party material
 
-Author and maintainer of this repository: thanhnndev, <https://github.com/thanhnndev>.
+Original author of this code base: thanhnndev, <https://github.com/thanhnndev> (project
+[thanhnndev/ga403wm-hackintosh](https://github.com/thanhnndev/ga403wm-hackintosh), GA403WM). This repository is its GA403UM
+continuation, maintained by joemens21, <https://github.com/joemens21>; the git history keeps each commit's author.
 
 Everything under `kexts/`, `macos/`, `scripts/`, `test/`, `tools/`, `docs/` is licensed under the [Clear BSD License](LICENSE).
 The items below are not covered by that license, or carry attribution requirements of their own.
