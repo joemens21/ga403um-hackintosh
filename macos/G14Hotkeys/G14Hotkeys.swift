@@ -9,7 +9,7 @@
 //   report 0x5A 0x7C          Fn+F9           mic mute                    -> default input: mute, or volume 0 / restore
 //   report 0x5A 0x10 / 0x20   Fn+F7 / Fn+F8   OLED brightness down / up   -> system brightness keys, else DPCD (edpbl.c)
 //   report 0x02 0xE2          Fn+F1           speaker mute (consumer)     -> default output: mute, or volume 0 / restore
-//   report 0x5A 0x38          ROG key         ignored for now
+//   report 0x5A 0x38          ROG key         opens RogControl (its window) in the console user's session
 // 0x5A 0x00 is the key release. Built-in Output (AppleALC) has no mute control, hence the volume fallback.
 import Foundation
 import IOKit.hid
@@ -166,6 +166,19 @@ func blKeep() {
     log("panel in its own mode: level \(blLast) restored -> \(blApply(blLast) ? "ok" : "failed")")
 }
 
+// MARK: ROG key
+
+// This daemon runs as root outside the login session: `open` has to run in the console user's session (launchctl asuser).
+// A running RogControl gets a reopen event and shows its window; otherwise it starts with the window open.
+func openRogControl() {
+    var st = stat()
+    guard stat("/dev/console", &st) == 0, st.st_uid != 0 else { log("ROG key: nobody logged in"); return }
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+    p.arguments = ["asuser", String(st.st_uid), "/usr/bin/open", "-b", "com.itlmt7925.RogControl"]
+    do { try p.run(); log("ROG key: RogControl") } catch { log("ROG key: open failed: \(error)") }
+}
+
 // MARK: N-KEY input reports
 
 // A press can arrive twice (same code, before or after its 0x00 release), so a code acts once until it is released and
@@ -191,6 +204,7 @@ func handle(_ id: UInt32, _ r: UnsafeMutablePointer<UInt8>, _ len: Int) {
         case 0x7C: toggleMute(input: true)
         case 0x10: brightnessKey(false)
         case 0x20: brightnessKey(true)
+        case 0x38: openRogControl()
         default: log(String(format: "key 5a %02x ignored", r[1]))
         }
     } else if id == 0x02 && len >= 3 && r[1] == 0xE2 && r[2] == 0x00 {
