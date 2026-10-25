@@ -25,6 +25,7 @@
 //   sysctl debug.asuswmi.ppt_spl=<W>       PL1 sustained   AC 15..80 W, battery 15..35 W   (0x001200A3)
 //   sysctl debug.asuswmi.ppt_sppt=<W>      PL2 slow        AC 25..80 W, battery 25..35 W   (0x001200A0)
 //   sysctl debug.asuswmi.ppt_fppt=<W>      PL3 fast        AC 35..80 W, battery 35..65 W   (0x001200C1)
+//                                          Without these WMI devices (GA403UM) the limits go to AmdCppc's SMU path, 8 W floor
 //   sysctl debug.asuswmi.charge_limit=<%>  battery charge end 20..100 (0x00120057)
 //   sysctl debug.asuswmi.probe=<dev id>    then read debug.asuswmi.probe: raw DSTS of any device id (exploration)
 //   sysctl debug.asuswmi.backlight[=<n>]   EC brightness level 0..200 through AWMI.WMAA (the NVIDIA WMI-EC backlight method:
@@ -89,8 +90,12 @@ static const Known kKnown[] = {
 
 // asus-armoury power_limits for DMI board GA403WM: { min, max } per source
 struct Range { int lo, hi; };
-static const Range kAcPpt[3] = { { 15, 80 }, { 25, 80 }, { 35, 80 } };   // spl, sppt, fppt
+static const Range kAcPpt[3] = { { 15, 80 }, { 25, 80 }, { 35, 80 } };   // spl, sppt, fppt (asus-armoury, GA403WM WMI path)
 static const Range kDcPpt[3] = { { 15, 35 }, { 25, 35 }, { 35, 65 } };
+// SMU path (no WMI power-limit devices, GA403UM / Hawk Point): the same ceilings, an 8 W floor for all three, the level
+// Phoenix handhelds ship as their lowest mode. Tested on a GA403UM: 10 W held exactly under full load, the system stayed usable.
+static const Range kAcPptSmu[3] = { { 8, 80 }, { 8, 80 }, { 8, 80 } };
+static const Range kDcPptSmu[3] = { { 8, 35 }, { 8, 35 }, { 8, 65 } };
 static const uint32_t kPptDev[3] = { DEV_PPT_SPL, DEV_PPT_SPPT, DEV_PPT_FPPT };
 
 class AsusWmi : public IOService {
@@ -143,6 +148,12 @@ public:
     IOReturn auraApply(uint32_t packed);
     IOReturn smuPpt(int i, int watts);
     bool pptSmu = false;                                         // the last power limit went through AmdCppc's SMU path
+    // -1 not asked yet; 1 DSTS of DEV_PPT_SPL has the present bit; 0 absent, or the BIOS refused a limit the SMU then took
+    // (the GA403UM's DSTS claims the device but DEVS fails: the path that actually worked decides the ranges)
+    int pptWmiPresent = -1;
+    bool pptWmi() { uint32_t v = 0; if (pptWmiPresent < 0) pptWmiPresent = dsts(DEV_PPT_SPL, &v) && (v & DSTS_PRESENT) ? 1 : 0;
+                    return pptWmiPresent == 1; }
+    const Range *pptRanges(bool ac) { return pptWmi() ? (ac ? kAcPpt : kDcPpt) : (ac ? kAcPptSmu : kDcPptSmu); }
     // hotkeys: Notify (ATKD, 0xFF), codes from _WED (0xFF), handled on a thread call
     IONotifier *atkNotifier = nullptr;
     thread_call_t evCall = nullptr;
@@ -526,14 +537,14 @@ IOReturn AsusWmi::setValue(int what, int v)
         break;
     case ASUS_SET_SPL: case ASUS_SET_SPPT: case ASUS_SET_FPPT: {
         int i = what - ASUS_SET_SPL;
-        const Range &r = (onAC() ? kAcPpt : kDcPpt)[i];
+        const Range &r = pptRanges(onAC())[i];
         if (v < r.lo || v > r.hi) return kIOReturnBadArgument;
         if (!fanCustom) return kIOReturnNotPermitted;            // asus-armoury: PPT needs an active custom fan curve here
-        ok = devs(kPptDev[i], (uint32_t)v, &ret);
+        ok = pptWmi() && devs(kPptDev[i], (uint32_t)v, &ret);
         if (!ok) {                                               // GA403UM BIOS: no WMI power-limit devices; AmdCppc's SMU path
             IOReturn s2 = smuPpt(i, v);
             say("set %d=%d -> wmi failed, smu %08x", what, v, s2);
-            if (s2 == kIOReturnSuccess) { pptSet[i] = (uint32_t)v; pptSmu = true; }
+            if (s2 == kIOReturnSuccess) { pptSet[i] = (uint32_t)v; pptSmu = true; pptWmiPresent = 0; }
             return s2;
         }
         pptSet[i] = (uint32_t)v; pptSmu = false;
@@ -628,7 +639,7 @@ void AsusWmi::getState(uint32_t st[ASUS_ST_COUNT])
     st[ASUS_ST_CPU_FAN_RPM] = dsts(DEV_CPU_FAN, &v) && (v & DSTS_PRESENT) ? (v & 0xffff) * 100 : 0;
     st[ASUS_ST_GPU_FAN_RPM] = dsts(DEV_GPU_FAN, &v) && (v & DSTS_PRESENT) ? (v & 0xffff) * 100 : 0;
     for (int i = 0; i < 3; i++) {
-        const Range &r = (ac ? kAcPpt : kDcPpt)[i];
+        const Range &r = pptRanges(ac)[i];
         st[ASUS_ST_SPL + i] = pptSet[i];
         st[ASUS_ST_SPL_MIN + 2 * i] = (uint32_t)r.lo;
         st[ASUS_ST_SPL_MAX + 2 * i] = (uint32_t)r.hi;
